@@ -15,7 +15,7 @@ REASONING_TOKEN_BUDGETS = {
 }
 REASONING_INSTRUCTIONS = {
     "low": "Check the decisive prerequisite briefly, then answer or call the next eligible tool.",
-    "medium": "Check prerequisites and the next step; stop immediately on a failed gate or a completed task.",
+    "medium": "Check prerequisites and the next step; repair recoverable errors and stop on task completion or unresolved permission/safety blocks.",
     "high": "Check dependencies, evidence, and failure branches before acting; verify the answer concisely.",
     "xhigh": "Examine alternatives, edge cases, and conflicting evidence; verify all action prerequisites before acting.",
     "max": "Use thorough analysis when needed, compare approaches, and verify constraints and results before acting.",
@@ -38,7 +38,11 @@ def reasoning_instruction(effort):
         f"Your reasoning ceiling is {REASONING_TOKEN_BUDGETS[effort]} tokens, "
         "or less if the total output budget is small. Finish reasoning early when sufficient; "
         "close the thinking block and provide the final answer or tool call. "
-        "More effort does not authorize additional actions. Never continue a failed prerequisite."
+        "More effort does not authorize additional actions. "
+        "Repair recoverable tool errors within existing permissions. "
+        "Never treat a failed prerequisite as satisfied or claim unverified success. "
+        "For requested actions, use tools rather than stopping with a plan or an unexecuted command. "
+        "Stop on unresolved permission or safety blocks, and verify uncertain external effects before retrying."
     )
 
 

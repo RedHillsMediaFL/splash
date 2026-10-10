@@ -27,6 +27,9 @@ Effort levels are runtime instructions and enforced ceilings, not a claim that
 the weights were trained for six levels or that higher effort improves accuracy.
 See [DEVELOPMENT.md](DEVELOPMENT.md) for API details and upstream limitations.
 
+Tool-error guidance repairs recoverable failures, verifies uncertain external
+effects before retrying, and respects unresolved permission or safety blocks.
+
 ## Build from source
 
 Requires macOS 26.4+, Xcode 26+ with the newer Metal 4 tensor compiler, and
@@ -68,6 +71,8 @@ The source was checked against that identity before adding public modification
 notices and whitespace-only cleanup. These change source fingerprints. No binary is distributed or
 rebuilt for this source release, and byte-for-byte build reproducibility is not
 claimed.
+This branch also includes a later Python-only tool-error guidance fix; the
+measured native executable remains unchanged.
 
 ## License
 

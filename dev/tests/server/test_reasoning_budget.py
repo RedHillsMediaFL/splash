@@ -16,6 +16,7 @@ from server.reasoning import (
     effort_messages,
     reasoning_budget,
     reasoning_capabilities,
+    reasoning_instruction,
 )
 from server.tool_schema import THINK_END_TOKEN_ID, TOOL_CALL_OPEN_TOKEN_ID
 
@@ -60,6 +61,19 @@ class ReasoningBudgetTests(unittest.TestCase):
         self.assertIn("Keep secrets private.", prepared[0]["content"])
         self.assertIn("Reasoning effort: high.", prepared[0]["content"])
         self.assertEqual(messages[0]["content"], "Keep secrets private.")
+
+    def test_recoverable_errors_do_not_erase_permission_or_evidence_requirements(self):
+        for effort in list(REASONING_TOKEN_BUDGETS)[1:]:
+            with self.subTest(effort=effort):
+                instruction = reasoning_instruction(effort)
+                self.assertIn("Repair recoverable tool errors within existing permissions.", instruction)
+                self.assertIn("Never treat a failed prerequisite as satisfied or claim unverified success.", instruction)
+                self.assertIn("use tools rather than stopping with a plan or an unexecuted command", instruction)
+                self.assertIn("More effort does not authorize additional actions.", instruction)
+                self.assertIn("Stop on unresolved permission or safety blocks", instruction)
+                self.assertIn("verify uncertain external effects before retrying", instruction)
+                self.assertNotIn("Never continue a failed prerequisite.", instruction)
+                self.assertNotIn("stop immediately on a failed gate", instruction)
 
     def test_output_budget_reserves_close_and_visible_answer(self):
         for total in (2, 4, 32, 512, 8192, 20000):
