@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "ops/PagedAttention.hpp"
@@ -466,17 +467,18 @@ void checkBf16StoreEdges(metal::MetalBackend &backend) {
 enum class Phase : uint8_t { Prefill, Verify };
 
 template <Phase phase>
-std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBounds) {
+std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBounds,
+                          bool m1Register = false, bool m1Reuse2 = false) {
   constexpr bool prefill = phase == Phase::Prefill;
   const auto plan = [&] {
     if constexpr (prefill)
-      return ops::PagedAttention::prefillPlan(data.rows, data.queryHeads, data.layout);
+      return ops::PagedAttention::prefillPlan(data.rows, data.queryHeads, data.layout, m1Register, m1Reuse2);
     else {
       std::vector<uint32_t> histories;
       for (uint32_t lane = 0; lane < data.lanes; ++lane)
         histories.push_back(data.stores[lane].committed_tokens);
       return ops::PagedAttention::verifyPlan(data.lanes, data.queryHeads, data.layout,
-                                            histories);
+                                            histories, m1Register);
     }
   }();
   constexpr uint64_t guardBytes = 256;
@@ -535,7 +537,11 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
                   params.split_count == plan.splits,
               "recorded prefill ABI does not describe the actual split plan");
     };
-    checkDispatch(graph.dispatches()[1], plan.splitGroups, plan.splitPipeline);
+    checkDispatch(graph.dispatches()[1], plan.splitGroups,
+                  plan.splitPipelineForHistory(data.stores[0].committed_tokens));
+    require(graph.dispatches()[1].threadsPerThreadgroup.x ==
+                plan.splitThreadsForHistory(data.stores[0].committed_tokens).x,
+            "prefill dispatch lost factory-built M1 thread geometry");
     checkDispatch(graph.dispatches()[2], plan.reduceGroups, plan.reducePipeline);
   } else {
     require(graph.dispatches().size() == 3, "production verify should encode store/split/reduce");
@@ -864,6 +870,74 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
 // Each buffer the RoPE tables reach, at its extent and one element short: the
 // target rows' three positions and the draft rows' one, each kind's inverse
 // frequencies, and its rows of cosines and sines.
+void checkM1Plans() {
+  const kv::Layout layout{1, 2, 256, kv::Format::Int8};
+  for (uint32_t rows = 1; rows <= 2048; ++rows) {
+    const auto generic = ops::PagedAttention::prefillPlan(rows, 16, layout);
+    const auto registerPlan = ops::PagedAttention::prefillPlan(rows, 16, layout, true, true);
+    require(registerPlan.workspace.partialsBytes == generic.workspace.partialsBytes &&
+                registerPlan.workspace.statisticsBytes == generic.workspace.statisticsBytes,
+            "M1 register attention changed the workspace bound");
+    require(registerPlan.splitPipeline == "prefill_attention_q8_m1_sgf_kv2_g8" &&
+                registerPlan.splitPipelineForHistory(4095) == registerPlan.splitPipeline,
+            "M1 attention reused K/V below the qualified history boundary");
+    const bool reuse = rows >= 512;
+    require(registerPlan.splitPipelineForHistory(4096) ==
+                (reuse ? "prefill_attention_q8_m1_reuse2_kv2_g8" : registerPlan.splitPipeline) &&
+                registerPlan.splitThreadsForHistory(4096).x == (reuse ? 128U : 256U),
+            "M1 reuse2 row/history boundary or thread geometry changed");
+  }
+  for (const auto other : {kv::Layout{1, 2, 256, kv::Format::BFloat16},
+                           kv::Layout{1, 4, 256, kv::Format::Int8}}) {
+    const uint32_t queryHeads = other.kvHeads == 2 ? 16 : 24;
+    const auto generic = ops::PagedAttention::prefillPlan(2048, queryHeads, other);
+    const auto requested = ops::PagedAttention::prefillPlan(2048, queryHeads, other, true, true);
+    require(generic.splitPipeline == requested.splitPipelineForHistory(16384),
+            "M1 policy changed BF16 or unsupported GQA geometry");
+  }
+  const std::array<uint32_t, 4> histories{0, 31, 1023, 16384};
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    const auto plan = ops::PagedAttention::verifyPlan(lanes, 16, layout,
+        std::span(histories).first(lanes), true);
+    const auto generic = ops::PagedAttention::verifyPlan(lanes, 16, layout,
+        std::span(histories).first(lanes));
+    require(plan.splitPipeline == "verify_attention_q8_m1_sgf_kv2_g8" &&
+                plan.workspace.partialsBytes == generic.workspace.partialsBytes &&
+                plan.workspace.statisticsBytes == generic.workspace.statisticsBytes &&
+                plan.laneSplits == generic.laneSplits,
+            "M1 verify dispatch changed lane history or workspace bounds");
+  }
+}
+
+void checkM1Numerics(metal::MetalBackend &backend) {
+  if (!backend.capabilities().m1Ultra) return;
+  const kv::Layout layout{1, 2, 256, kv::Format::Int8};
+  for (const auto [history, rows] : std::array<std::array<uint32_t, 2>, 9>{{
+      {0, 1}, {33, 7}, {255, 17}, {1023, 480}, {4095, 512},
+      {4096, 512}, {6145, 2048}, {16383, 257}, {16384, 1057}}}) {
+    auto data = makeCase(backend, 16, layout, 1, rows, history, false);
+    const auto registerOutput = run<Phase::Prefill>(backend, data, true, true, false);
+    checkReference(data, registerOutput);
+    const auto reuseOutput = run<Phase::Prefill>(backend, data, true, true, true);
+    checkReference(data, reuseOutput);
+    require(registerOutput == reuseOutput, "M1 reuse2 changed register attention output bits");
+    auto oneExtent = makeCase(backend, 16, layout, 1, rows, history, false, true);
+    require(run<Phase::Prefill>(backend, oneExtent, false, true, true) == reuseOutput,
+            "M1 prefill changed output across fragmented KV extents");
+    std::cout << "M1 register prefill: history=" << history << " rows=" << rows << " PASS\n";
+  }
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+    for (uint32_t history : {0U, 1023U, 16384U}) {
+      auto data = makeCase(backend, 16, layout, lanes, 8, history, true);
+      const auto output = run<Phase::Verify>(backend, data, true, true);
+      checkReference(data, output);
+      auto oneExtent = makeCase(backend, 16, layout, lanes, 8, history, true, true);
+      require(run<Phase::Verify>(backend, oneExtent, false, true) == output,
+              "M1 verify changed output across fragmented KV extents");
+      std::cout << "M1 register verify: history=" << history << " lanes=" << lanes << " PASS\n";
+    }
+}
+
 void ropeExtents(metal::MetalBackend &backend) {
   constexpr RopeTableParams rows{37, 24};
   test::requireExtents(backend,
@@ -889,11 +963,13 @@ int main(int argc, char **argv) {
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
       for (uint32_t heads : {24U, 16U})
         checkPlans(heads, {1, heads == 24 ? 4U : 2U, 256, format});
+    checkM1Plans();
     if (argc == 1) {
       std::cout << "paged attention plans: CPU PASS\n";
       return 0;
     }
     metal::MetalBackend backend(argv[1]);
+    checkM1Numerics(backend);
     checkBf16StoreEdges(backend);
     ropeExtents(backend);
     for (uint32_t heads : {24U, 16U})

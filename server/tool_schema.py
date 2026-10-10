@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 """Tool and response-format schema normalization and llguidance grammars."""
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from .schema_validation import (
     json_objects,
     subschemas,
 )
+
+TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 # The chat template's tool-call tags, as it lays a call out: grammars write
 # calls that way, and the projector reads them that way (output.py). A call
@@ -852,11 +855,8 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
             raise APIError(400, "only function tools are supported")
         function = tool.get("function")
         name = function.get("name") if isinstance(function, dict) else None
-        if (
-            not isinstance(name, str)
-            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name) is None
-        ):
-            raise APIError(400, "tool name must match [A-Za-z0-9_-]{1,128}")
+        if not isinstance(name, str) or TOOL_NAME.fullmatch(name) is None:
+            raise APIError(400, f"tool name must match {TOOL_NAME.pattern}")
         if name in schemas:
             raise APIError(400, f"duplicate tool name: {name}")
         schema = function.get("parameters")

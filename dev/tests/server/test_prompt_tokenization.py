@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 import random
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +17,7 @@ from tokenizers import (
 from transformers import PreTrainedTokenizerFast
 
 from server import judgments
-from server.tokenization import PromptTokenizer
+from server.tokenization import PromptTokenizer, tokenizable
 
 
 def tokenizer():
@@ -203,6 +204,39 @@ class PromptTokenizationTests(unittest.TestCase):
         before = stats["bytes"]
         self.assert_encoding("x" * 50000 + "<|im_end|>tail", cache)
         self.assertEqual(cache.stats()["bytes"], before)
+
+    def test_lone_surrogates_encode_as_replacement_characters(self):
+        prefix = "<|im_start|>user\n" + "Hello world!\n" * 400 + "<|im_end|>"
+        for text, replaced in (
+            ("Hello \ud83d world", "Hello \ufffd world"),
+            ("\udfff\ud800", "\ufffd\ufffd"),
+            (prefix + "\ud83d!", prefix + "\ufffd!"),
+            ("a\ud83d" + prefix + "b", "a\ufffd" + prefix + "b"),
+        ):
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(tokenizable(text), replaced)
+                self.assertEqual(len(tokenizable(text)), len(text))
+                self.assertEqual(
+                    self.cache.encode(text),
+                    self.tokenizer(replaced, add_special_tokens=False)["input_ids"],
+                )
+        with self.assertRaises(TypeError):
+            self.tokenizer("Hello \ud83d world", add_special_tokens=False)
+
+    def test_frontend_tokenization_normalizes_surrogates_only(self):
+        from server.frontend import Frontend
+
+        frontend = mock.MagicMock()
+        frontend.tokenizer.return_value = {"input_ids": [7]}
+        for text, normalized in (
+            ("Code and emoji \U0001f332", "Code and emoji \U0001f332"),
+            ("a\ud83db", "a\ufffdb"),
+        ):
+            self.assertEqual(
+                Frontend._tokenize(frontend, text, add_special_tokens=False),
+                {"input_ids": [7]},
+            )
+            frontend.tokenizer.assert_called_with(normalized, add_special_tokens=False)
 
     def test_short_prompts_and_missing_boundary_bypass_cache(self):
         for text in (

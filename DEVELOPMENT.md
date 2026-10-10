@@ -1,4 +1,5 @@
 # Development
+> Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 
 This document runs from using Splash to working on it: running and
 configuring the server, the [API](#api), the [models](#models) it loads, its
@@ -280,7 +281,7 @@ files. [Installation](#installation) gives the mechanics.
 To download new models to another disk, set the cache location before serving:
 
 ```sh
-HF_HUB_CACHE=/Volumes/Models/huggingface splash serve --model mlx-community/Qwen3.8-27B-4bit
+HF_HUB_CACHE="$HOME/models/huggingface" splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
 `HF_HUB_CACHE` selects the Hugging Face download cache. Alternatively, set
@@ -330,8 +331,10 @@ or null. Accepted values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
 `max`. An explicit request value wins; the CLI flag takes precedence over the
 environment. Unset, the model's template default is unchanged. An effort, the
 default or a request's own, reaches the template as `enable_thinking`, false
-for `none`, and as `reasoning_effort`, not as a token budget, so a template that
-switches reasoning by either follows it. A template that rejects an effort
+for `none`, and as `reasoning_effort`, so a template that switches reasoning by
+either follows it. Explicit effort profiles also enforce native token ceilings
+and add a matching instruction; `none` changes neither the prompt nor the
+unconstrained generation fast path. A template that rejects an effort
 renders an alias: `xhigh` for `high` and `max`, `low` for `minimal`; one that
 rejects `none` renders by `enable_thinking` alone while thinking is off.
 
@@ -350,6 +353,53 @@ passed to the template as variables and outrank the effort, so
 at the template's default effort where the effort is `none`. `enable_thinking`
 must be a boolean; null leaves it to the effort. They cannot set what Splash
 passes itself, such as `tools` or `add_generation_prompt`.
+
+### Request-local reasoning levels
+
+This runtime supports six canonical effort levels:
+
+| Effort | Maximum reasoning tokens |
+| --- | ---: |
+| `none` | 0, thinking disabled |
+| `low` | 64 |
+| `medium` | 256 |
+| `high` | 1,024 |
+| `xhigh` | 4,096 |
+| `max` | 16,384 |
+
+`minimal` remains a compatibility alias for `low`. These are ceilings, not
+minimum lengths or promises of higher accuracy. Easy requests can finish early
+at every level. With an explicit thinking-on override of `none` or an unset
+effort, the effective budget is `medium`; a thinking-off override disables it.
+The unselected model-template default remains unchanged.
+
+Native token masks enforce the ceiling in greedy, sampled, and speculative
+generation, composing with tool/JSON grammars rather than bypassing them. At
+the ceiling only `</think>` is allowed; answer generation then resumes under
+the original grammar. Rejected draft tokens do not consume the budget.
+
+`max_tokens`/`max_completion_tokens` still bound the **total** generated output,
+including reasoning and its close. A quarter of that total, between one and
+512 tokens, is reserved for the visible answer, plus one token for the close;
+the reasoning ceiling is reduced if necessary. Thinking with fewer than two
+total output tokens is rejected. A reserve is space, not a guarantee that an
+arbitrarily long answer fits. A client stop sequence or cancellation can still
+interrupt generation. Increase the total budget to use the full higher levels.
+
+Chat usage `completion_tokens_details` and Responses usage
+`output_tokens_details` report `reasoning_effort`, `reasoning_tokens`,
+`reasoning_requested_budget_tokens`, `reasoning_budget_tokens`,
+`reasoning_budget_clamped`, `answer_reserve_tokens`, and
+`reasoning_budget_exhausted`. `/v1/models` and `/v1/models/{id}` expose supported
+efforts, aliases, ceilings, and the configured default under `reasoning`.
+
+```json
+{"model":"local-coder","messages":[{"role":"user","content":"Check this plan."}],"reasoning_effort":"high","max_completion_tokens":2048}
+```
+
+Responses requests use `"reasoning":{"effort":"high"}` and
+`max_output_tokens`. These are request-local instructions and enforced ceilings,
+not an established accuracy improvement at higher effort levels.
 
 ## Agent launchers
 

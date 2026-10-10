@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "ops/Sampling.hpp"
 
 #include "metal/abi/Sampling.h"
@@ -316,6 +317,43 @@ void Sampling::addAcceptance(
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,
              buffers.acceptedCounts},
             params, {lanes, 1, 1}, {1, 1, 1});
+}
+
+void Sampling::addGreedyVerifyAndAcceptance(
+    metal::CommandGraph &graph, SamplingBuffers sampling,
+    AcceptanceBuffers acceptance, std::span<const uint32_t> maximumRetained,
+    std::span<const SamplingPolicy> policies, uint32_t stopToken0,
+    uint32_t stopToken1) const {
+  if (maximumRetained.empty() || maximumRetained.size() > kMaximumLanes ||
+      maximumRetained.size() != policies.size())
+    throw std::invalid_argument("invalid fused greedy batch");
+  AcceptBatchParams acceptanceParams{};
+  acceptanceParams.stop_token_0 = stopToken0;
+  acceptanceParams.stop_token_1 = stopToken1;
+  const uint32_t lanes = static_cast<uint32_t>(policies.size());
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    if (!maximumRetained[lane] || maximumRetained[lane] > SPLASH_TARGET_VERIFY_ROWS ||
+        policies[lane].samples() || policies[lane].constrained || policies[lane].penalties.active())
+      throw std::invalid_argument("invalid fused greedy lane");
+    acceptanceParams.remaining[lane] = maximumRetained[lane];
+  }
+  const TargetSamplingParams selectionParams = selection(
+      policies, sampling,
+      {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION, SPLASH_DRAFT_PROPOSAL_TOKENS},
+      stopToken0, stopToken1);
+  requireBytes(acceptance.proposedTokens,
+               uint64_t{lanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t), "proposed token");
+  requireBytes(acceptance.outputTokens,
+               uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * sizeof(uint32_t), "target token");
+  requireBytes(acceptance.retainedCounts, lanes * sizeof(uint32_t), "retained count");
+  requireBytes(acceptance.acceptedCounts, lanes * sizeof(uint32_t), "accepted count");
+  graph.add("decode_sample_argmax_sharded",
+            {sampling.logits, sampling.constraintMasks, sampling.argmaxValues, sampling.argmaxIndices},
+            selectionParams, {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * kTargetShards, 1, 1});
+  graph.add("decode_argmax_accept_greedy",
+            {sampling.argmaxValues, sampling.argmaxIndices, acceptance.proposedTokens,
+             acceptance.outputTokens, acceptance.retainedCounts, acceptance.acceptedCounts},
+            acceptanceParams, {lanes, 1, 1}, {32 * SPLASH_TARGET_VERIFY_ROWS, 1, 1});
 }
 
 } // namespace splash::ops

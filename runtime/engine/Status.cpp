@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "engine/Status.hpp"
 
 #include "engine/Json.hpp"
@@ -243,6 +244,11 @@ std::string runtimeStatusJson(
       << ",\"total_gpu_ms\":" << executorTelemetry.totalDecodeGpuSeconds * 1000.0
       << ",\"total_wall_ms\":" << executorTelemetry.totalDecodeWallSeconds * 1000.0
       << "}}"
+      << ",\"prompt_lookup\":{\"enabled\":" << boolean(executorTelemetry.promptLookupEnabled)
+      << ",\"batches\":" << executorTelemetry.promptLookupBatches
+      << ",\"proposed_tokens\":" << executorTelemetry.promptLookupProposedTokens
+      << ",\"accepted_tokens\":" << executorTelemetry.promptLookupAcceptedTokens << "}"
+      << ",\"fused_greedy\":{\"enabled\":" << boolean(executorTelemetry.fusedGreedyEnabled) << "}"
       << ",\"constraint_masks\":{\"overlap_batches\":"
       << executorTelemetry.constrainedMaskOverlapBatches
       << ",\"overlap_requests\":"

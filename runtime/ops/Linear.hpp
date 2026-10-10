@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #pragma once
 
 #include "metal/DeviceCapabilities.hpp"
@@ -72,7 +73,8 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // prefill tile. GgufRegister is Q4Register's twin over GGUF weights, exact:
 // every request lane in one threadgroup, optional K splits.
 enum class LinearTile : uint8_t {
-  N128, N256, Paired128, Split128, Paired256, Q4Register, GgufStaged, GgufPrefill, GgufRegister
+  N128, N256, Paired128, Split128, Paired256, Q4Register, GgufStaged, GgufPrefill, GgufRegister,
+  M1Prefill, M1Register
 };
 // The decode tiles hold at most a full decode batch; GGUF prefill chunks of up
 // to this many rows run the staged tile (Linear::ggufBaseline).
@@ -253,9 +255,10 @@ inline constexpr uint32_t kAssumedGpuCores = 32;
 // M4), whose matrix operations share the FP32 pipe, and Apple10 (family 10
 // and later: M5, M6), whose cores each hold a neural accelerator. Startup
 // refuses families below 9.
-enum class GpuFamilyClass : uint8_t { Apple9, Apple10 };
+enum class GpuFamilyClass : uint8_t { Apple9, Apple10, M1Ultra };
 [[nodiscard]] constexpr GpuFamilyClass gpuFamilyClass(uint32_t appleGpuFamily) noexcept {
-  return appleGpuFamily >= 10 ? GpuFamilyClass::Apple10 : GpuFamilyClass::Apple9;
+  return appleGpuFamily == 7 ? GpuFamilyClass::M1Ultra
+      : appleGpuFamily >= 10 ? GpuFamilyClass::Apple10 : GpuFamilyClass::Apple9;
 }
 
 // Owns projection pipeline selection and dispatch for both weight layouts.
@@ -349,6 +352,8 @@ private:
                             const Projection &projection, const LinearPlan &plan) const;
   GpuFamilyClass family_;
   uint32_t gpuCores_ = 0;
+  // workarounds for Metal compiler faults not present on Apple9 hardware.
+  bool m1Ultra_ = false;
 };
 
 } // namespace splash::ops

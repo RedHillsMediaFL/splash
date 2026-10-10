@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #pragma once
 
 #include "ops/DraftAttention.hpp"
@@ -48,6 +49,10 @@ private:
   Linear linear_;
   uint32_t moeRouteWideRows_;
   GpuFamilyClass family_;
+  bool m1Ultra_;
+  uint32_t m1PrefillMoeM8MaxRows_;
+  bool m1AttentionRegister_;
+  bool m1AttentionReuse2_;
 };
 
 } // namespace splash::ops

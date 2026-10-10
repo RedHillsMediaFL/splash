@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 // The prefill FFN's Neural Engine split (ops/AneFfn.cpp, kernels/prefill/ane_ffn.metal):
 // - inputs: ane_ffn_rotate and ane_ffn_pack turn bf16 rows into the ANE's channel-major int8 segments at their stride
 //   and the rows' scales, as a CPU rotation of the rows does;
@@ -1094,6 +1095,11 @@ int main(int argc, char **argv) {
   }
   try {
     MetalBackend backend(argv[1]);
+    if (mode != "kernels" && backend.capabilities().m1Ultra) {
+      std::cout << "ane-ffn " << mode
+                << ": skipped; M1 Ultra uses the GPU-only prefill FFN path\n";
+      return 0;
+    }
     if (mode == "kernels") {
       std::vector<float> sign(ANE_FFN_INTERMEDIATE_BLOCK);
       for (float &value : sign) value = rng() & 1 ? -1.0f : 1.0f;

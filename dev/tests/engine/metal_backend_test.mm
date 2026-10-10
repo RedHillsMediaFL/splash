@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "TestBuffers.hpp"
@@ -1478,8 +1479,16 @@ void run(const std::string &metallibPath) {
             "recommended working set capability is missing");
     require(capabilities.maxBufferLengthBytes > 0,
             "maximum buffer length capability is missing");
-    require(capabilities.appleGpuFamily >= 9,
+    require(capabilities.appleGpuFamily >= 9 || capabilities.m1Ultra,
             "Apple GPU family capability is missing");
+    require(capabilities.m1Ultra ==
+                splash::DeviceCapabilities::isM1Ultra(
+                    capabilities.hardwareAppleGpuFamily,
+                    capabilities.gpuCoreCount),
+            "M1 Ultra detection does not match the hardware family and core count");
+    require(!capabilities.m1Ultra ||
+                (capabilities.hardwareAppleGpuFamily == 7 && capabilities.appleGpuFamily == 7),
+            "M1 Ultra policy adopted a different GPU family");
     require(capabilities.maxThreadgroupMemoryBytes >= 32 * 1024,
             "threadgroup memory capability is insufficient");
     require(capabilities.maxThreadgroupWidth >= 1024,
@@ -1487,6 +1496,9 @@ void run(const std::string &metallibPath) {
     const auto probed = splash::metal::probeDeviceCapabilities();
     require(probed.deviceName == capabilities.deviceName &&
                 probed.appleGpuFamily == capabilities.appleGpuFamily &&
+                probed.hardwareAppleGpuFamily ==
+                    capabilities.hardwareAppleGpuFamily &&
+                probed.m1Ultra == capabilities.m1Ultra &&
                 probed.macosVersion() == capabilities.macosVersion() &&
                 !probed.validationMessage(),
             "the device check read the device differently from the backend");

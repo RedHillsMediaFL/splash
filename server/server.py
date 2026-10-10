@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 """HTTP routes, protocol responses and serving-process startup."""
 
 import argparse
@@ -74,6 +75,7 @@ from .output import (
     StreamingToolCallProjector,
     validate_response_content,
 )
+from .reasoning import reasoning_capabilities
 from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
 # Request bodies held at once, from upload through preparation and, for what
@@ -548,6 +550,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "context_length": self.app.max_context,
                     "vision": self.app.vision,
                     "input_modalities": self.app.input_modalities,
+                    "reasoning": reasoning_capabilities(
+                        self.app.default_reasoning_effort
+                    ),
                     **(
                         {"root": self.app.response_model}
                         if name != self.app.response_model

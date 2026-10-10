@@ -1,7 +1,9 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #import "MetalBackend.hpp"
 #include "AwakeClock.hpp"
 #include "CommandWatchdog.hpp"
 #include "Residency.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
 #include "BackendInstrumentation.hpp"
 #endif
@@ -111,6 +113,9 @@ void readDeviceCapabilities(id<MTLDevice> device,
     for (uint32_t next = 7;
          [device supportsFamily:static_cast<MTLGPUFamily>(1000 + next)]; ++next)
         family = next;
+    capabilities.hardwareAppleGpuFamily = family;
+    capabilities.m1Ultra =
+        DeviceCapabilities::isM1Ultra(family, capabilities.gpuCoreCount);
     capabilities.appleGpuFamily = family;
     capabilities.physicalMemoryBytes = NSProcessInfo.processInfo.physicalMemory;
     capabilities.recommendedMaxWorkingSetBytes =
@@ -662,8 +667,28 @@ struct MetalBackend::Impl {
                 "missing Metal function: " + std::string(name));
         }
         NSError *error = nil;
-        id<MTLComputePipelineState> result =
-            [device newComputePipelineStateWithFunction:function error:&error];
+        id<MTLComputePipelineState> result = nil;
+        if (capabilities.m1Ultra &&
+            (name == "decode_sample_vocabulary_search" ||
+             name == "decode_sample_vocabulary_draw" ||
+             name == "norm_rms_staged" || name == "norm_rms_staged_f32")) {
+            MTLComputePipelineDescriptor *descriptor =
+                [[MTLComputePipelineDescriptor alloc] init];
+            descriptor.computeFunction = function;
+            descriptor.maxTotalThreadsPerThreadgroup =
+                (name == "decode_sample_vocabulary_search" ||
+                 name == "decode_sample_vocabulary_draw")
+                    ? SPLASH_TARGET_VOCABULARY_THREADS
+                    : SPLASH_STAGED_NORM_THREADS;
+            descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+            result = [device newComputePipelineStateWithDescriptor:descriptor
+                          options:MTLPipelineOptionNone
+                          reflection:nil
+                          error:&error];
+        } else {
+            result = [device newComputePipelineStateWithFunction:function
+                         error:&error];
+        }
         if (!result) {
             throw MetalBackendError(
                 "unable to create Metal pipeline " + std::string(name) +
@@ -745,8 +770,12 @@ struct MetalBackend::Impl {
             item.pipeline = pipeline(item.source->pipelineName);
             if (item.threadCount >
                 item.pipeline.maxTotalThreadsPerThreadgroup) {
-                throw MetalBackendError(
-                    "threadsPerThreadgroup exceeds pipeline capability");
+                std::ostringstream message;
+                message << "threadsPerThreadgroup exceeds pipeline capability: "
+                        << item.source->pipelineName << " requests "
+                        << item.threadCount << ", maximum "
+                        << item.pipeline.maxTotalThreadsPerThreadgroup;
+                throw MetalBackendError(message.str());
             }
         }
 

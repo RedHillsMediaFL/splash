@@ -1,11 +1,14 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "TestChecks.hpp"
 #include "ops/ExecutionPlans.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace {
 using namespace splash;
@@ -229,14 +232,66 @@ void ggufMoePlans() {
   rejects([&] { (void)MoE::prefillPlan(shape, 1, {MoeExpertTile::M32, moeRouteWideRows(kAssumedGpuCores),
                                                   MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); },
           "the register expert tile takes block 8-row tiles", "the register tile took 32-row tiles");
-  // GGUF kernels exist for 8-row tiles and 32-row prefill tiles only, affine
-  // ones for 32-row prefill and 8-row decode tiles.
   rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); },
           "invalid MoE expert tile configuration", "a GGUF decode plan took 32-row tiles");
   rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M32}); },
           "invalid MoE expert tile configuration", "an affine decode plan took 32-row tiles");
-  rejects([&] { (void)MoE::prefillPlan(routedShape, 9, {MoeExpertTile::M8}); },
-          "invalid MoE expert tile configuration", "an affine prefill plan took 8-row tiles");
+  const auto fusedPrefill = MoE::prefillPlan(routedShape, 9, {MoeExpertTile::M8});
+  require(fusedPrefill.tileRows() == 8 && !fusedPrefill.splitExperts(),
+          "an affine 8-row prefill plan did not use its fused expert passes");
+  rejects([&] { (void)MoE::prefillPlan(routedShape, 9, {static_cast<MoeExpertTile>(16)}); },
+          "invalid MoE expert tile configuration", "an unsupported expert tile was accepted");
+}
+
+void m1ExpertPolicies() {
+  constexpr const char *setting = "SPLASH_M1_PREFILL_MOE_M8_MAX_ROWS";
+  const char *previous = std::getenv(setting);
+  const bool wasSet = previous != nullptr;
+  const std::string original = previous ? previous : "";
+  unsetenv(setting);
+  DeviceCapabilities m1 = device(7);
+  m1.hardwareAppleGpuFamily = 7;
+  m1.gpuCoreCount = 48;
+  m1.m1Ultra = true;
+  const ExecutionPlans defaults(m1);
+  require(defaults.moePrefill(routedShape, 1).tileRows() == 32,
+          "M1 prefill must remain opt-in");
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+    require(defaults.moeDecode(routedShape, lanes).configuration().m8Simdgroups == MoeExpertSimdgroups::Eight &&
+                defaults.moeDecode(routedShape, lanes).configuration().kernel == MoeExpertKernel::M1Register,
+            "M1 affine decode adopted the Apple9 MPP/four-simdgroup policy");
+  for (uint32_t limit : {13U, 128U, 2048U}) {
+    setenv(setting, std::to_string(limit).c_str(), 1);
+    const ExecutionPlans configured(m1);
+    setenv(setting, "0", 1);
+    const auto bound = configured.moePrefillWorkspace(routedShape, 2048);
+    for (uint32_t rows = 1; rows <= 2048; ++rows) {
+      const auto plan = configured.moePrefill(routedShape, rows);
+      require(plan.tileRows() == (rows <= limit ? 8U : 32U),
+              "M1 startup expert tile policy changed after construction");
+      require(!plan.splitExperts() && plan.configuration().kernel == MoeExpertKernel::M1Register,
+              "M1 prefill did not retain fused register expert passes");
+      covers(bound, plan.workspace(), 1, kMoeWorkspaceFields);
+    }
+  }
+  for (const char *invalid : {"-1", "2049", "1.5", "12trailing"}) {
+    setenv(setting, invalid, 1);
+    rejects([&] { (void)ExecutionPlans(m1); }, "must be an integer from 0 to 2048",
+            "an invalid M1 prefill limit was accepted");
+  }
+  setenv(setting, "invalid", 1);
+  DeviceCapabilities ordinary = device(9);
+  ordinary.hardwareAppleGpuFamily = 9;
+  ordinary.gpuCoreCount = 48;
+  require(ExecutionPlans(ordinary).moePrefill(routedShape, 1).tileRows() == 32,
+          "a non-M1 device consumed the M1 setting");
+  m1.gpuCoreCount = 16;
+  require(ExecutionPlans(m1).moePrefill(routedShape, 1).tileRows() == 32,
+          "a smaller Apple7 device consumed the M1 Ultra setting");
+  if (wasSet)
+    setenv(setting, original.c_str(), 1);
+  else
+    unsetenv(setting);
 }
 
 // A device that reports no core count gets the plans of kAssumedGpuCores
@@ -337,6 +392,7 @@ int main() {
     baselinePlans();
     moeDeviceTiles();
     ggufMoePlans();
+    m1ExpertPolicies();
     unknownCoreCount();
     workspaceBounds();
     invalidLookupsAndContextEdges();

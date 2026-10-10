@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "engine/RuntimeResources.hpp"
 #include "AwakeClock.hpp"
 #include "Checked.hpp"
@@ -462,8 +463,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
-    logLine("Kernel policy for GPU family ", device.appleGpuFamily,
-            " with ", device.gpuCoreCount, " cores.");
+    if (device.m1Ultra)
+      logLine("Kernel policy for M1 Ultra, ", device.gpuCoreCount,
+              " GPU cores, physical Apple7 register-matrix policy.");
+    else
+      logLine("Kernel policy for GPU family ", device.appleGpuFamily,
+              " with ", device.gpuCoreCount, " cores.");
     AneFfnStart aneFfn =
         startAneFfn(aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled),
                     config.aneFfn,
@@ -705,6 +710,13 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   AneFfnModel model;
   model.dense = !layers->empty();
   if (!model.dense) return model;
+  // Splash 1.3's ANE split is not bounded on M1 Ultra: a direct evaluation
+  // can remain inside ANEServices indefinitely. Keep this supported host on
+  // the verified GPU-only FFN path instead of entering calibration.
+  if (backend.capabilities().m1Ultra) {
+    model.unsupported = "the M1 Ultra uses the GPU-only prefill FFN path";
+    return model;
+  }
   if (const char *reason = ops::AneFfn::unsupported(*layers)) {
     model.unsupported = reason;
     return model;

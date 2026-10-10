@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 // The faults runtime/ane/ProgramInstrumentation.hpp injects into ane::Program, on the Neural Engine: an Objective-C
 // exception the framework raises becomes a std::runtime_error, at construction and at an evaluation; a method whose
 // type encoding changed fails construction; and a throwing enqueue and a failed, a stalled and a delayed evaluation
@@ -109,6 +110,10 @@ int main(int argc, char **argv) {
   }
   try {
     metal::MetalBackend backend(argv[1]);
+    if (backend.capabilities().m1Ultra) {
+      std::cout << "ane-program-faults: skipped; M1 Ultra uses the GPU-only prefill FFN path\n";
+      return 0;
+    }
     AneSum sum(backend);
     const test::TemporaryDirectory cache("splash-ane-faults");
     construction(sum, cache.path());

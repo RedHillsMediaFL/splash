@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 // GGUF projections: plan policy and dispatch (kernels/shared/gguf_linear.metal,
 // kernels/decode/linear_gguf_sgmatrix.metal).
 #include "Linear.hpp"
@@ -75,7 +76,7 @@ constexpr SplitTier kStagedTiers[] = {{6, 512}};
 // 0.012 ms projection), where the fitted tier above is 13-27% slower on
 // 17408 x 5120 and 12288 x 5120 and 50% on 2048 x 512.
 std::span<const SplitTier> stagedTiers(GpuFamilyClass family) noexcept {
-  if (family == GpuFamilyClass::Apple9) return kRegisterTiers;
+  if (family == GpuFamilyClass::Apple9 || family == GpuFamilyClass::M1Ultra) return kRegisterTiers;
   return kStagedTiers;
 }
 
@@ -257,14 +258,16 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
         : LinearConfig{.tile = LinearTile::GgufPrefill};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
-  if (family_ == GpuFamilyClass::Apple9 && !apple9Stages(w, projections)) return registerDecode(n, k, gpuCores_);
+  if ((family_ == GpuFamilyClass::Apple9 || family_ == GpuFamilyClass::M1Ultra) && !apple9Stages(w, projections))
+    return registerDecode(n, k, gpuCores_);
   return stagedDecode(n, k, gpuCores_, family_);
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
-  if (family_ == GpuFamilyClass::Apple9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_)).scratchSize());
+  if (family_ == GpuFamilyClass::Apple9 || family_ == GpuFamilyClass::M1Ultra)
+    size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_)).scratchSize());
   return size;
 }
 
@@ -320,7 +323,9 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   case LinearTile::Paired128:
   case LinearTile::Split128:
   case LinearTile::Paired256:
-  case LinearTile::Q4Register: break;
+  case LinearTile::Q4Register:
+  case LinearTile::M1Prefill:
+  case LinearTile::M1Register: break;
   }
 }
 
@@ -411,6 +416,31 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
   const metal::DispatchSize grid{segmentColumns(p) / GGUF_TILE_COLUMNS, config.splits, 1};
   const std::string suffix = "_l" + std::to_string(lanes);
   const auto [partials, counters] = splitScratch(b, config.splits);
+  const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
+                          const metal::MetalBuffer &aux,
+                          metal::DispatchSize dispatchGrid) {
+    graph.add(kernelInstance(std::string("gguf_decode_sg_") + s.name() + suffix + "_" + epilogue, plan.destination()),
+              {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
+              GgufDecodeParams{k, config.splits, n, s.columnOffset}, dispatchGrid, {GGUF_REGISTER_THREADS, 1, 1});
+  };
+  // The M1 Ultra compiler miscompiles the fused register kernel when an
+  // IQ4_NL segment has multiple lanes, and can hang it at three or four
+  // lanes for other mixed-format projections. Each segment's standalone
+  // kernel is correct; its partials and counter are disjoint by column.
+  const bool separateIq4nl =
+      m1Ultra_ && lanes > 1 &&
+      std::any_of(segments.begin(), segments.end(), [](const QuantizedSegment &s) {
+        return s.formatId == GGUF_FMT_IQ4NL;
+      });
+  const bool separateWideBatch = m1Ultra_ && lanes >= 3;
+  if (segments.size() > 1 && (separateIq4nl || separateWideBatch)) {
+    if (w.epilogue != LinearEpilogue::None)
+      throw std::invalid_argument("a fused block projection takes no epilogue");
+    for (const QuantizedSegment &s : segments)
+      tensor(s, epilogueSuffix(LinearEpilogue::None), b.output, b.output,
+             {s.outputSize / GGUF_TILE_COLUMNS, config.splits, 1});
+    return;
+  }
   if (segments.size() > 1) {
     std::vector<const QuantizedSegment *> order;
     for (const QuantizedSegment &s : segments) order.push_back(&s);
@@ -420,13 +450,11 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
     graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params, grid, {GGUF_REGISTER_THREADS, 1, 1});
     return;
   }
-  const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
-                          const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(std::string("gguf_decode_sg_") + s.name() + suffix + "_" + epilogue, plan.destination()),
-              {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
-              GgufDecodeParams{k, config.splits, n, s.columnOffset}, grid, {GGUF_REGISTER_THREADS, 1, 1});
+  const auto singleTensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
+                                const metal::MetalBuffer &aux) {
+    tensor(s, epilogue, output, aux, grid);
   };
-  addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
+  addDecodeTensor(b, w.epilogue, segments.front(), gate, singleTensor);
 }
 
 // Float segments of a projection (QuantizedSegment::isFloat): a float projection

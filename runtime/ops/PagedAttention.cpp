@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "ops/PagedAttention.hpp"
 
 #include "metal/abi/RoPE.h"
@@ -122,7 +123,7 @@ uint32_t prefillSplits(uint32_t tiles) {
 } // namespace
 
 PrefillAttentionPlan PagedAttention::prefillPlan(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout) {
+    uint32_t rows, uint32_t queryHeads, kv::Layout layout, bool m1Register, bool m1Reuse2) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows)
     throw std::invalid_argument("invalid attention workspace rows");
@@ -130,22 +131,24 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
   const uint32_t splits = prefillSplits(tiles);
   const uint32_t fusedRows =
       kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
+  const bool registerTile = m1Register && kernel == KernelLayout::Kv2Group8 && layout.format == kv::Format::Int8;
   return {rows, splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              layout.headDimension),
           layout.format == kv::Format::BFloat16
               ? pipeline(kernel, "prefill_attention_bf16_split",
                          "prefill_attention_bf16_split_kv2_g8")
-              : pipeline(kernel, "prefill_attention_q8_split",
-                         "prefill_attention_q8_split_kv2_g8"),
+              : registerTile ? "prefill_attention_q8_m1_sgf_kv2_g8"
+              : pipeline(kernel, "prefill_attention_q8_split", "prefill_attention_q8_split_kv2_g8"),
           pipeline(kernel, "prefill_attention_reduce",
                    "prefill_attention_reduce_kv2_g8"),
-          {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, layout, queryHeads};
+          {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, layout, queryHeads,
+          registerTile && m1Reuse2 ? "prefill_attention_q8_m1_reuse2_kv2_g8" : ""};
 }
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens) {
+    std::span<const uint32_t> historyTokens, bool m1Register) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid attention workspace batch width");
@@ -166,8 +169,9 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           layout.format == kv::Format::BFloat16
               ? pipeline(kernel, "verify_attention_bf16_split",
                          "verify_attention_bf16_split_kv2_g8")
-              : pipeline(kernel, "verify_attention_q8_split",
-                         "verify_attention_q8_split_kv2_g8"),
+              : m1Register && kernel == KernelLayout::Kv2Group8
+                  ? "verify_attention_q8_m1_sgf_kv2_g8"
+                  : pipeline(kernel, "verify_attention_q8_split", "verify_attention_q8_split_kv2_g8"),
           pipeline(kernel, "verify_attention_reduce",
                    "verify_attention_reduce_kv2_g8"),
           {layout.kvHeads, splits, lanes},
@@ -371,9 +375,9 @@ void PagedAttention::addPrefill(
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits};
-  graph.add(std::string(plan.splitPipeline),
+  graph.add(std::string(plan.splitPipelineForHistory(chunk.committed_tokens)),
             {std::move(queries), partials, statistics, std::move(pageTable)},
-            params, plan.splitGroups);
+            params, plan.splitGroups, plan.splitThreadsForHistory(chunk.committed_tokens));
   graph.add(std::string(plan.reducePipeline),
             {std::move(partials), std::move(statistics), std::move(output)},
             params, plan.reduceGroups);

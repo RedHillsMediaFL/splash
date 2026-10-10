@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 // Sparse MoE against a CPU reference with real Q4 expert weights: routing,
 // expert grouping (including partially filled tiles), the grouped gate/up and
 // down tiles, and the combine, for the M8 decode and M32 prefill plans and the
@@ -72,7 +73,7 @@ constexpr uint32_t kRoutesPerRow = kTopK + 1;
 constexpr uint32_t kGpuCores = 20;
 // Covers both router tiles: 8-row tiles below 520 rows and 32-row tiles with
 // a ragged 8-row tail from there.
-constexpr uint32_t kMaximumRows = 520;
+constexpr uint32_t kMaximumRows = 2048;
 // The router's rows are the expert slots, which each input row's scores
 // fill; its Q8 planes hold them as one storage tile, and the shared scalar
 // gate pads its one row to a tile.
@@ -591,8 +592,14 @@ void planBounds() {
             "a decode of no lanes was accepted");
     rejects([&] { (void)shipped.moeDecode(shape, 5); }, "invalid MoE decode width",
             "a decode wider than a batch was accepted");
-    rejects([&] { (void)MoE::prefillPlan(shape, 1, {MoeExpertTile::M8}); },
-            "invalid MoE expert tile configuration", "an affine prefill plan took 8-row tiles");
+    for (uint32_t rows : {1U, 9U, 33U, 520U, 2048U}) {
+      const auto fusedPrefill = MoE::prefillPlan(shape, rows, {MoeExpertTile::M8});
+      require(!fusedPrefill.splitExperts() && fusedPrefill.tileRows() == 8,
+              "an 8-row affine prefill plan did not use fused expert passes");
+      checkPlan(fusedPrefill);
+    }
+    rejects([&] { (void)MoE::prefillPlan(shape, 1, {static_cast<MoeExpertTile>(16)}); },
+            "invalid MoE expert tile configuration", "an invalid expert tile was accepted");
     rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); },
             "invalid MoE expert tile configuration", "an affine decode plan took 32-row tiles");
   }
@@ -626,7 +633,18 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
               dispatches[3].pipelineName == "moe_gather_rows" &&
               dispatches[combine].pipelineName == "moe_combine",
           "MoE plan chose inconsistent pipelines");
-  if (split) {
+  if (plan.configuration().kernel == splash::ops::MoeExpertKernel::M1Register) {
+    const bool narrowRows = plan.tileRows() == 8;
+    require(!split && dispatches[experts].pipelineName ==
+                (narrowRows ? "moe_expert_gate_up_q4_m1_register_m8" : "moe_expert_gate_up_q4_m1_register_m32") &&
+                dispatches[experts + 1].pipelineName ==
+                (narrowRows ? "moe_expert_down_q4_m1_register_m8" : "moe_expert_down_q4_m1_register_m32") &&
+                dispatches[experts].threadgroups.x == kIntermediate / (narrowRows ? 64 : 32) &&
+                dispatches[experts + 1].threadgroups.x == kHidden / (narrowRows ? 128 : 64) &&
+                dispatches[experts].threadsPerThreadgroup.x == 128 &&
+                dispatches[experts + 1].threadsPerThreadgroup.x == 128,
+            "M1 expert dispatch lost its measured register geometry");
+  } else if (split) {
     require(dispatches[experts].pipelineName ==
                     "prefill_moe_expert_q4_n256_m32" &&
                 dispatches[experts + 1].pipelineName ==
@@ -684,6 +702,7 @@ void bufferBounds(MetalBackend &backend, Fixture &fixture) {
   const ExecutionPlans shipped = plans(10);
   // The split prefill passes and the fused decode tile.
   for (const MoePlan &plan : {shipped.moePrefill(fixture.shape, 33),
+                              MoE::prefillPlan(fixture.shape, 33, {MoeExpertTile::M8}),
                               shipped.moeDecode(fixture.shape, 4)}) {
     allocateScratch(backend, fixture, plan);
     const auto rejectWeights = [&](const MoeWeights &weights, const std::string &refusal, const char *label) {
@@ -908,6 +927,15 @@ void run(const std::string &metallibPath) {
       }
     };
     const ExecutionPlans shipped = plans(10), narrow = plans(9);
+    if (backend.capabilities().m1Ultra) {
+      for (uint32_t rows : {1U, 7U, 8U, 9U, 31U, 32U, 33U, 263U, 2048U})
+        for (auto tile : {MoeExpertTile::M8, MoeExpertTile::M32}) {
+          MoeConfig config{tile, moeRouteWideRows(kGpuCores)};
+          config.kernel = splash::ops::MoeExpertKernel::M1Register;
+          (void)execute(MoE::prefillPlan(fixture.shape, rows, config),
+                        "M1 register rows=" + std::to_string(rows));
+        }
+    }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const std::string label = "decode B" + std::to_string(lanes);
       const auto baseline = execute(shipped.moeDecode(fixture.shape, lanes), label);
@@ -922,8 +950,16 @@ void run(const std::string &metallibPath) {
     // 33 and 263 leave 8-row ones next to full tiles; 519/520 straddle the
     // wide router tile threshold.
     for (uint32_t rows : {1U, 3U, 7U, 8U, 9U, 12U, 31U, 32U, 33U, 48U, 100U,
-                          255U, 256U, 263U, 519U, kMaximumRows})
+                          255U, 256U, 263U, 519U, 520U, kMaximumRows})
       (void)execute(shipped.moePrefill(fixture.shape, rows), "prefill rows=" + std::to_string(rows));
+    for (uint32_t rows : {1U, 7U, 8U, 9U, 12U, 31U, 32U, 33U, 100U, 255U, 263U, 519U, 520U, 2048U}) {
+      const MoeConfig eight{MoeExpertTile::M8, moeRouteWideRows(kGpuCores)};
+      const MoeConfig four{MoeExpertTile::M8, moeRouteWideRows(kGpuCores), MoeExpertSimdgroups::Four};
+      const std::string label = "prefill M8 rows=" + std::to_string(rows);
+      const auto baseline = execute(MoE::prefillPlan(fixture.shape, rows, eight), label);
+      requireEqual(execute(MoE::prefillPlan(fixture.shape, rows, four), label + " sg4"), baseline,
+                   label + " four-simdgroup");
+    }
   }
   std::cout << "moe_metal_test: PASS cases=" << cases
             << " wall_seconds=" << wallSeconds << '\n';

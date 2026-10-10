@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "tuning/LinearTuning.hpp"
 
 #include "tuning/LinearNumerics.hpp"
@@ -177,6 +178,11 @@ std::vector<LinearPlan> linearCandidates(const DeviceCapabilities &device,
         }))
       result.push_back(Linear::plan(w, config, ops::FloatOutput::BFloat16));
   };
+  if (gpuFamilyClass(device.appleGpuFamily) == GpuFamilyClass::M1Ultra) {
+    if (w.phase == LinearPhase::Decode)
+      append({LinearTile::M1Register, 0, LinearSimdgroups::Four});
+    return result;
+  }
   const uint32_t columns = w.matrix.outputSize;
   if (w.phase == LinearPhase::Prefill) {
     // The fused up projection has no eight-simdgroup N128 kernel.
@@ -303,7 +309,10 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
     const std::optional<LinearPlan> exactPlain = fields[ReferenceGate]
         ? std::optional{Linear::plan(
               {workload.matrix, workload.rows, LinearPhase::Decode, LinearEpilogue::None},
-              {LinearTile::N128, workload.matrix.outputSize / 128}, ops::FloatOutput::BFloat16)}
+              gpuFamilyClass(backend.capabilities().appleGpuFamily) == GpuFamilyClass::M1Ultra
+                  ? LinearConfig{LinearTile::M1Register, 0, LinearSimdgroups::Four}
+                  : LinearConfig{LinearTile::N128, workload.matrix.outputSize / 128},
+              ops::FloatOutput::BFloat16)}
         : std::nullopt;
     float operandSlack = 0;
     auto referenceGateUp = [&](uint32_t representative) {
@@ -315,9 +324,9 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       if (!exactPlain) return;
       const auto &weights = input.weights[representative];
       metal::CommandGraph graph;
-      linear.add(graph, {buffers.input, fields[ReferenceGate], {}, {}, {}, {}},
+      linear.add(graph, {buffers.input, fields[ReferenceGate], {}, {}, {}, {}, buffers.scratch},
                  *weights.gate, *exactPlain);
-      linear.add(graph, {buffers.input, fields[ReferenceUp], {}, {}, {}, {}},
+      linear.add(graph, {buffers.input, fields[ReferenceUp], {}, {}, {}, {}, buffers.scratch},
                  weights.projection, *exactPlain);
       (void)backend.submitCommandAsync(graph.dispatches()).wait();
     };

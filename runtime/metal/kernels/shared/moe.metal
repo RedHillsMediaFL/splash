@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
@@ -57,8 +58,11 @@ kernel void moe_route_scores_q8_m8(
   constexpr uint Slots = SPLASH_MOE_EXPERT_SLOTS;
   constexpr uint Simdgroups = 8;
   static_assert(Simdgroups == kMoeRouteSlices, "one simdgroup per K slice");
+  static_assert(Rows * 64 * sizeof(bfloat) == Rows * TileN * sizeof(float),
+                "the routing stage and partials must occupy equal slices");
   threadgroup uint4 staged_storage[Simdgroups * Rows * 64 * 2 / 16];
-  threadgroup float partials[Simdgroups * Rows * TileN];
+  threadgroup float *partials =
+      reinterpret_cast<threadgroup float *>(staged_storage);
   threadgroup float parameters[Simdgroups * 2 * TileN];
   threadgroup float sums[Simdgroups * Rows];
   const uint row_base = group.x * Rows;

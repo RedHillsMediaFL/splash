@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "metal/DeviceCapabilities.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
@@ -31,7 +32,8 @@ std::optional<std::string> DeviceCapabilities::validationError() const {
         return "recommended_working_set_exceeds_physical_memory";
     }
     if (!maxBufferLengthBytes) return "max_buffer_length_unavailable";
-    if (appleGpuFamily < kMinimumAppleGpuFamily) return "apple_gpu_family_9_required";
+    if (appleGpuFamily < kMinimumAppleGpuFamily &&
+        !isM1Ultra(appleGpuFamily, gpuCoreCount)) return "apple_gpu_family_9_required";
     if (maxThreadgroupMemoryBytes < 32 * 1024) {
         return "threadgroup_memory_below_32_kib";
     }

@@ -1,8 +1,10 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 """Tokenizer contract and cached token-level output constraints."""
 
 import threading
 from concurrent.futures import Future, wait
 
+import numpy as np
 from llguidance import LLExecutor, LLMatcher, LLTokenizer
 from llguidance.hf import from_tokenizer as guidance_tokenizer
 from llguidance.numpy import (
@@ -106,6 +108,102 @@ class TokenConstraint:
                 raise ConstraintError(
                     error.splitlines()[0] if error else "invalid token"
                 )
+
+
+class ReasoningBudgetConstraint:
+    def __init__(self, budget, constraint=None):
+        if type(budget) is not int or budget < 0:
+            raise ValueError("reasoning budget must be a nonnegative integer")
+        self.budget = budget
+        self.constraint = constraint
+        self.reasoning_tokens = 0
+        self.thinking = True
+        self.budget_exhausted = False
+        self._lock = threading.Lock()
+        self._committed = []
+
+    def commit(self, token_ids):
+        tokens = tuple(token_ids)
+        if any(not 0 <= token < TokenConstraint.VOCABULARY for token in tokens):
+            raise ConstraintError("generated token is out of range")
+        with self._lock:
+            self._committed.append(tokens)
+            if self.constraint is not None:
+                self.constraint.commit(tokens)
+
+    def _consume_committed(self):
+        with self._lock:
+            batches, self._committed = self._committed, []
+        for batch in batches:
+            for token in batch:
+                if not self.thinking:
+                    continue
+                if token == THINK_END_TOKEN_ID:
+                    self.thinking = False
+                    self.budget_exhausted = self.reasoning_tokens >= self.budget
+                elif (
+                    self.reasoning_tokens >= self.budget
+                    or token in TokenConstraint.EOS_TOKENS
+                    or token == TOOL_CALL_OPEN_TOKEN_ID
+                ):
+                    raise ConstraintError(
+                        "generated token violated the reasoning budget"
+                    )
+                else:
+                    self.reasoning_tokens += 1
+
+    def masks(self, simulation_tokens):
+        if len(simulation_tokens) >= TokenConstraint.MAX_ROWS:
+            raise ConstraintError("too many simulation tokens")
+        self._consume_committed()
+        rows = len(simulation_tokens) + 1
+        columns = (TokenConstraint.VOCABULARY + 31) // 32
+        if self.constraint is None:
+            masks = np.full((rows, columns), 0xFFFFFFFF, dtype=np.uint32)
+        else:
+            masks = (
+                np.frombuffer(self.constraint.masks(simulation_tokens), dtype=np.uint32)
+                .reshape(rows, columns)
+                .copy()
+            )
+        thinking, used = self.thinking, self.reasoning_tokens
+        valid = True
+        for row_index in range(rows):
+            row = masks[row_index]
+            if not valid:
+                row[:] = masks[row_index - 1]
+                continue
+            if thinking:
+                if used >= self.budget:
+                    close_word, close_bit = divmod(THINK_END_TOKEN_ID, 32)
+                    permits_close = int(row[close_word]) & (1 << close_bit)
+                    row[:] = 0
+                    row[close_word] = permits_close
+                else:
+                    for token in (*TokenConstraint.EOS_TOKENS, TOOL_CALL_OPEN_TOKEN_ID):
+                        word, bit = divmod(token, 32)
+                        row[word] &= np.uint32(0xFFFFFFFF ^ (1 << bit))
+            if not row.any():
+                raise ConstraintError(
+                    "reasoning budget conflicts with the output grammar"
+                )
+            if row_index < len(simulation_tokens):
+                token = simulation_tokens[row_index]
+                valid = 0 <= token < TokenConstraint.VOCABULARY
+                if valid:
+                    word, bit = divmod(token, 32)
+                    valid = bool(int(row[word]) & (1 << bit))
+                if valid and thinking:
+                    if token == THINK_END_TOKEN_ID:
+                        thinking = False
+                    else:
+                        used += 1
+        return masks.tobytes()
+
+    def finish(self):
+        self._consume_committed()
+        if self.constraint is not None:
+            self.constraint.finish()
 
 
 def validate_tokenizer(tokenizer):

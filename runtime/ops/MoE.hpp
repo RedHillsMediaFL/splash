@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #pragma once
 
 #include "metal/CommandGraph.hpp"
@@ -190,6 +191,7 @@ enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 // eight. Either choice writes bit-identical outputs and needs the same
 // workspace; only the down pass's column grid changes.
 enum class MoeExpertSimdgroups : uint8_t { Eight = 8, Four = 4 };
+enum class MoeExpertKernel : uint8_t { Mpp, M1Register };
 
 [[nodiscard]] constexpr MoeExpertSimdgroups
 moeDecodeSimdgroups(GpuFamilyClass family) noexcept {
@@ -213,7 +215,8 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 // IQ3_XXS experts, and the IQ2, IQ3_XXS and IQ1 formats alone, 4-21% faster
 // staged at B1-B4, where Q4_K/Q5_K, Q2_K and IQ4_XS experts take 3-34% longer.
 [[nodiscard]] inline MoeGgufTile moeGgufTile(GpuFamilyClass family, MoeShape shape) noexcept {
-  return family == GpuFamilyClass::Apple9 && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
+  return (family == GpuFamilyClass::Apple9 || family == GpuFamilyClass::M1Ultra) &&
+      !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
                                                                                       : MoeGgufTile::Staged;
 }
 
@@ -235,8 +238,6 @@ enum class MoePhase : uint8_t { Prefill, Decode };
 
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
-  // M32 for affine prefill plans, M8 for decode plans; a GGUF prefill plan
-  // takes moeGgufPrefillTile's.
   MoeExpertTile expertTile = MoeExpertTile::M32;
   // Rows from which the router uses the 32-row scores tile; the execution
   // plans derive it from the GPU core count.
@@ -250,6 +251,7 @@ struct MoeConfig final {
   // The tile of a GGUF plan's F32 router; the execution plans derive it from
   // the device and the plan's rows (Linear::ggufFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
+  MoeExpertKernel kernel = MoeExpertKernel::Mpp;
   bool operator==(const MoeConfig &) const = default;
 };
 

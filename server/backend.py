@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 """Native request submission, cancellation, recovery and completion ownership."""
 
 import copy
@@ -12,7 +13,7 @@ from tokenizers.decoders import DecodeStream
 from . import json_codec
 from . import protocol as wire
 from . import runtime as engine_runtime
-from .constraints import TokenConstraint
+from .constraints import ReasoningBudgetConstraint, TokenConstraint
 from .diagnostics import print_status
 from .errors import APIError, ConstraintError
 from .latency import RequestLatency
@@ -88,12 +89,16 @@ class Job:
     thinking: bool = False
     thinking_display: str = "summarized"
     reasoning_tokens: int = 0
+    reasoning_effort: str | None = None
+    reasoning_requested_budget_tokens: int | None = None
+    reasoning_budget_tokens: int | None = None
+    reasoning_answer_reserve_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
     cancelled: threading.Event = field(default_factory=threading.Event)
     tool_policy: ToolPolicy | None = None
     response_validator: object | None = None
     response_format: dict | None = None
-    constraint: TokenConstraint | None = None
+    constraint: TokenConstraint | ReasoningBudgetConstraint | None = None
     cache: CacheInfo = field(default_factory=CacheInfo)
     # Image placeholder spans with their grids and digests, plus the
     # concatenated resized pixels the engine encodes during prefill.

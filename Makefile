@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 XCRUN := xcrun
 CXX := $(XCRUN) -sdk macosx clang++
 METAL := $(XCRUN) -sdk macosx metal
@@ -58,10 +59,12 @@ KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 # macOS 26.2 or newer, and MPP chooses its code path by this target.
 MACOS_MIN_VERSION := 26.4
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
+# Host codegen for the M1 Ultra (Firestorm). GPU policy is selected at runtime.
+HOST_CPU_FLAG := -mcpu=apple-m1
 PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
-	$(MACOS_TARGET_FLAG)
+	$(MACOS_TARGET_FLAG) $(HOST_CPU_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
 .PHONY: all clean force-build-identity install \

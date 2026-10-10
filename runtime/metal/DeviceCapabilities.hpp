@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #pragma once
 
 #include <cstdint>
@@ -16,9 +17,16 @@ struct DeviceCapabilities {
     uint32_t macosMajor = 0;
     uint32_t macosMinor = 0;
     uint32_t macosPatch = 0;
-    // Highest supported MTLGPUFamilyAppleN.
     static constexpr uint32_t kMinimumAppleGpuFamily = 9;
     uint32_t appleGpuFamily = 0;
+    uint32_t hardwareAppleGpuFamily = 0;
+    // 48- and 64-core Apple7 parts are M1 Ultra GPUs. No other Apple7 GPU has
+    // either core count; smaller M1 and M2 systems remain unsupported.
+    bool m1Ultra = false;
+    [[nodiscard]] static constexpr bool isM1Ultra(uint32_t hardwareFamily,
+                                                  uint32_t gpuCores) noexcept {
+        return hardwareFamily == 7 && (gpuCores == 48 || gpuCores == 64);
+    }
     // IORegistry gpu-core-count; zero means unavailable. ops::plannedGpuCores
     // substitutes ops::kAssumedGpuCores for kernel policy. Keep the missing
     // value here (status reports it).

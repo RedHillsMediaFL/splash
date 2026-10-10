@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "ops/MoE.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
@@ -154,6 +155,21 @@ void addAffineExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
                              shape.experts, 0,
                              weights.expertDown.expertStrideBytes,
                              weights.expertDown.expertStrideBytes};
+  if (plan.configuration().kernel == MoeExpertKernel::M1Register) {
+    const bool narrowRows = plan.tileRows() == 8;
+    const uint32_t gateColumns = narrowRows ? 64 : 32;
+    const uint32_t downColumns = narrowRows ? 128 : 64;
+    graph.add(narrowRows ? "moe_expert_gate_up_q4_m1_register_m8" : "moe_expert_gate_up_q4_m1_register_m32",
+              {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
+               weights.expertGate.packed, weights.expertUp.packed, weights.sharedGate.packed,
+               weights.sharedUp.packed, scratch.expertIntermediate},
+              gateUp, {shape.expertIntermediateSize / gateColumns, tiles, 1}, {128, 1, 1});
+    graph.add(narrowRows ? "moe_expert_down_q4_m1_register_m8" : "moe_expert_down_q4_m1_register_m32",
+              {scratch.expertIntermediate, scratch.tileDescriptors, scratch.tileCount,
+               weights.expertDown.packed, weights.sharedDown.packed, scratch.expertOutput},
+              down, {shape.hiddenSize / downColumns, tiles, 1}, {128, 1, 1});
+    return;
+  }
   if (plan.splitExperts()) {
     // The gate lands in expertOutput, which the down pass overwrites only
     // after the up pass has consumed it.
@@ -244,14 +260,19 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
 MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
                  MoePhase phase)
     : shape_(shape), rows_(rows), config_(config),
-      splitExperts_(shape.weightLayout == WeightLayout::Block32 || phase == MoePhase::Prefill) {
-  // Affine plans have 32-row prefill and 8-row decode kernels, GGUF plans
-  // 8-row kernels in both phases and 32-row prefill kernels.
-  const bool gguf = shape.weightLayout == WeightLayout::Block32;
+      splitExperts_(shape.weightLayout == WeightLayout::Block32 ||
+                    (phase == MoePhase::Prefill && config.expertTile == MoeExpertTile::M32 &&
+                     config.kernel != MoeExpertKernel::M1Register)) {
   const bool prefill = phase == MoePhase::Prefill;
-  if ((!prefill && config.expertTile != MoeExpertTile::M8) ||
-      (!gguf && prefill && config.expertTile != MoeExpertTile::M32))
+  if ((config.expertTile != MoeExpertTile::M8 && config.expertTile != MoeExpertTile::M32) ||
+      (!prefill && config.expertTile != MoeExpertTile::M8))
     throw std::invalid_argument("invalid MoE expert tile configuration");
+  if (config.m8Simdgroups != MoeExpertSimdgroups::Four && config.m8Simdgroups != MoeExpertSimdgroups::Eight)
+    throw std::invalid_argument("invalid MoE expert simdgroup configuration");
+  if (config.kernel != MoeExpertKernel::Mpp && config.kernel != MoeExpertKernel::M1Register)
+    throw std::invalid_argument("invalid MoE expert kernel configuration");
+  if (config.kernel == MoeExpertKernel::M1Register && shape.weightLayout != WeightLayout::Affine64)
+    throw std::invalid_argument("M1 register experts require affine weights");
   if (config.ggufTile == MoeGgufTile::Register &&
       (shape.weightLayout != WeightLayout::Block32 || config.expertTile != MoeExpertTile::M8))
     throw std::invalid_argument("the register expert tile takes block 8-row tiles");

@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "TestChecks.hpp"
 #include "TestModel.hpp"
 #include "TestStderr.hpp"
@@ -178,6 +179,11 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   executorTelemetry.totalDecodeWallSeconds = 1.5;
   executorTelemetry.imageEncodes = 3;
   executorTelemetry.imageEmbeddingReuses = 4;
+  executorTelemetry.promptLookupEnabled = true;
+  executorTelemetry.fusedGreedyEnabled = true;
+  executorTelemetry.promptLookupBatches = 6;
+  executorTelemetry.promptLookupProposedTokens = 42;
+  executorTelemetry.promptLookupAcceptedTokens = 35;
   executorTelemetry.visionArenaBytes = 5;
   executorTelemetry.embeddingCacheBytes = 6;
   executorTelemetry.stateHeldImageBytes = 7;

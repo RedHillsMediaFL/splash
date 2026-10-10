@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #pragma once
 
 #include "metal/CommandGraph.hpp"
@@ -113,16 +114,27 @@ struct PrefillAttentionPlan final {
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
 
+  [[nodiscard]] std::string_view splitPipelineForHistory(uint32_t historyTokens) const noexcept {
+    return usesReuse2(historyTokens) ? reuse2Pipeline_ : splitPipeline;
+  }
+  [[nodiscard]] metal::DispatchSize splitThreadsForHistory(uint32_t historyTokens) const noexcept {
+    return {usesReuse2(historyTokens) ? 128U : 256U, 1, 1};
+  }
+
 private:
   friend class PagedAttention;
+  const std::string_view reuse2Pipeline_;
+  [[nodiscard]] bool usesReuse2(uint32_t historyTokens) const noexcept {
+    return !reuse2Pipeline_.empty() && rows >= 512 && historyTokens >= 4096;
+  }
   PrefillAttentionPlan(uint32_t rows, uint32_t splits, AttentionWorkspace workspace,
                        std::string_view splitPipeline, std::string_view reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                       kv::Layout layout, uint32_t queryHeads)
+                       kv::Layout layout, uint32_t queryHeads, std::string_view reuse2Pipeline)
       : layout(layout), queryHeads(queryHeads), rows(rows),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
-        splitGroups(splitGroups), reduceGroups(reduceGroups) {}
+        splitGroups(splitGroups), reduceGroups(reduceGroups), reuse2Pipeline_(reuse2Pipeline) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -177,12 +189,13 @@ public:
   // The kernels read a sequence's history from its chunk parameters, so a
   // plan depends on the rows only.
   [[nodiscard]] static PrefillAttentionPlan
-  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout);
+  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout,
+              bool m1Register = false, bool m1Reuse2 = false);
   // historyTokens holds each lane's committed tokens before its verify rows,
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens);
+             std::span<const uint32_t> historyTokens, bool m1Register = false);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences

@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "AffineQ4Fixture.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -794,7 +795,7 @@ std::set<std::string_view> floatOutputPlans() {
     return p;
   };
   std::set<std::string_view> kernels;
-  for (const uint32_t family : {9U, 10U, 11U})
+  for (const uint32_t family : {7U, 9U, 10U, 11U})
     for (uint32_t cores = 0; cores <= 128; ++cores) {
       const Linear linear = gpu(family, cores);
       for (const uint32_t n : {256U, 5120U, 16640U, 248320U})
@@ -1281,6 +1282,56 @@ void apple10AffineCoreLaws() {
 // contracts check the tuner's candidates keep the policy's plan first, legal
 // grids and no duplicates; they do not claim performance on simulated
 // hardware.
+void m1AffinePlans() {
+  const Linear m1 = gpu(7, 48);
+  for (uint32_t rows : {1U, 33U, 2048U})
+    for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                          LinearEpilogue::UpWithGate}) {
+      const auto plan = m1.plan({{512, 2048}, rows, LinearPhase::Prefill, epilogue});
+      require(plan.configuration().tile == LinearTile::M1Prefill &&
+                  plan.threadsPerThreadgroup() == 128 && plan.tileColumns() == 64,
+              "physical M1 prefill adopted an Apple9 MPP tile");
+    }
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+    for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+      const auto plan = m1.plan({{248320, 2048}, lanes * 8, LinearPhase::Decode, epilogue});
+      require(plan.configuration().tile == LinearTile::M1Register && plan.usesQ4Register() &&
+                  plan.input() == LinearInput::Table64 && plan.threadsPerThreadgroup() == 128,
+              "physical M1 decode lost its FP32/multi-lane register tile");
+    }
+  require(gpuFamilyClass(7) == GpuFamilyClass::M1Ultra &&
+              gpuFamilyClass(9) == GpuFamilyClass::Apple9 &&
+              gpuFamilyClass(10) == GpuFamilyClass::Apple10,
+          "M1 dispatch policy impersonates another physical GPU family");
+  for (const uint32_t cores : {48U, 64U}) {
+    const auto device = simulatedDevice(7, cores);
+    const Linear linear(device);
+    const auto requireCandidates = [&](LinearWorkload workload) {
+      const auto candidates = tuning::linearCandidates(device, workload);
+      const auto baseline = linear.plan(workload).configuration();
+      const bool splitDecode = workload.phase == LinearPhase::Decode && baseline.splits > 1;
+      require(candidates.size() == (splitDecode ? 2U : 1U) &&
+                  candidates.front().configuration() == baseline,
+              "M1 tuning enumerated physically unsupported MPP candidates");
+      if (splitDecode)
+        require(candidates.back().configuration() ==
+                    LinearConfig{LinearTile::M1Register, 0, LinearSimdgroups::Four},
+                "M1 tuning omitted its unsplit register reference");
+    };
+    for (const auto matrix : {LinearMatrix{512, 256}, LinearMatrix{16640, 5120},
+                              LinearMatrix{248320, 2048}}) {
+      for (const uint32_t lanes : {1U, 2U, 3U, 4U})
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                                   LinearEpilogue::GateUp})
+          requireCandidates({matrix, lanes * 8, LinearPhase::Decode, epilogue});
+      for (const uint32_t rows : {1U, 33U, 2048U})
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                                   LinearEpilogue::UpWithGate})
+          requireCandidates({matrix, rows, LinearPhase::Prefill, epilogue});
+    }
+  }
+}
+
 void scalingContracts() {
   for (uint32_t family : {9U, 10U, 11U}) {
     for (uint32_t index = 0; index <= 129; ++index) {
@@ -2155,7 +2206,8 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
           throw std::runtime_error("an fp32 output does not round to its bf16 plan's output");
         }
     }
-    if (plan.configuration().splits > 1 || plan.usesQ4Register()) {
+    if (plan.configuration().splits > 1 ||
+        (plan.usesQ4Register() && plan.configuration().tile != LinearTile::M1Register)) {
       splitOutputs.push_back({{output, output + elements}, immutableResidual, plan.pipeline(), plan.usesQ4Register()});
     } else {
       if (baseline.empty()) baseline.assign(output, output + elements);
@@ -2171,14 +2223,20 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
   // N128 plain plan on both weight sets.
   std::vector<uint16_t> gateReference, upReference;
   if (workload.epilogue == LinearEpilogue::GateUp) {
+    const bool m1Register = gpuFamilyClass(backend.capabilities().appleGpuFamily) == GpuFamilyClass::M1Ultra;
     const auto plain = Linear::plan({workload.matrix, workload.rows, LinearPhase::Decode,
                                        LinearEpilogue::None},
-                                      {LinearTile::N128, p.outputSize / 128}, FloatOutput::BFloat16);
+                                      m1Register ? LinearConfig{LinearTile::M1Register, 0, LinearSimdgroups::Four}
+                                                 : LinearConfig{LinearTile::N128, p.outputSize / 128},
+                                      FloatOutput::BFloat16);
     auto gateOutput = allocate(backend, uint64_t{storageRows} * p.outputSize * 2);
     auto upOutput = allocate(backend, uint64_t{storageRows} * p.outputSize * 2);
+    const auto scratch = plain.scratchSize();
+    const LinearScratch referenceScratch{allocate(backend, scratch.input), allocate(backend, scratch.sums),
+                                         allocate(backend, scratch.partials), allocate(backend, scratch.counters)};
     metal::CommandGraph graph;
-    linear.add(graph, {input, gateOutput, {}, {}, {}, {}}, gate, plain);
-    linear.add(graph, {input, upOutput, {}, {}, {}, {}}, p, plain);
+    linear.add(graph, {input, gateOutput, {}, {}, {}, {}, referenceScratch}, gate, plain);
+    linear.add(graph, {input, upOutput, {}, {}, {}, {}, referenceScratch}, p, plain);
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
     const auto *g = static_cast<const uint16_t *>(gateOutput.contents());
     const auto *u = static_cast<const uint16_t *>(upOutput.contents());
@@ -2230,7 +2288,7 @@ void floatInstances(const char *metallib, const std::set<std::string_view> &kern
 // launches, the policy's plain decode plans also into fp32, with its threads
 // per threadgroup: one pipeline never takes two execution scopes.
 // Device-free.
-std::map<std::string, uint32_t> pipelineScopes() {
+std::map<std::string, uint32_t> pipelineScopes(const DeviceCapabilities *hardware = nullptr) {
   std::map<std::string, uint32_t> names{{"prefill_linear_q4_sums32", 256}};
   const auto collect = [&](const DeviceCapabilities &device, LinearWorkload workload) {
     std::vector<LinearPlan> plans = tuning::linearCandidates(device, workload);
@@ -2245,6 +2303,16 @@ std::map<std::string, uint32_t> pipelineScopes() {
                 "one Linear pipeline was assigned incompatible execution scopes");
       }
   };
+  if (hardware && gpuFamilyClass(hardware->appleGpuFamily) == GpuFamilyClass::M1Ultra) {
+    for (const uint32_t lanes : {1U, 2U, 3U, 4U})
+      for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                                 LinearEpilogue::GateUp})
+        collect(*hardware, {{16640, 5120}, lanes * 8, LinearPhase::Decode, epilogue});
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                               LinearEpilogue::UpWithGate})
+      collect(*hardware, {{16640, 5120}, 33, LinearPhase::Prefill, epilogue});
+    return names;
+  }
   for (const uint32_t family : {9U, 10U, 11U})
     for (const uint32_t cores : {0U, 10U, 16U, 20U, 40U, 80U}) {
       const DeviceCapabilities device = simulatedDevice(family, cores);
@@ -2301,10 +2369,11 @@ int main(int argc, char **argv) {
             "usage: linear-plan <production.metallib|--cpu|--capabilities production.metallib>");
     if (capabilities) {
       metal::MetalBackend backend(argv[2]);
-      pipelineCapabilities(argv[2], backend.capabilities(), pipelineScopes());
+      pipelineCapabilities(argv[2], backend.capabilities(), pipelineScopes(&backend.capabilities()));
       return 0;
     }
     baselinePlans();
+    m1AffinePlans();
     affinePolicyLaws();
     ggufPlans();
     scratchBoundsRotated();

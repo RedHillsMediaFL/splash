@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #pragma once
 
 #include "metal/CommandGraph.hpp"
@@ -157,6 +158,11 @@ public:
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
+      std::span<const SamplingPolicy> policies, uint32_t stopToken0,
+      uint32_t stopToken1) const;
+  void addGreedyVerifyAndAcceptance(
+      metal::CommandGraph &graph, SamplingBuffers sampling,
+      AcceptanceBuffers acceptance, std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
       uint32_t stopToken1) const;
 

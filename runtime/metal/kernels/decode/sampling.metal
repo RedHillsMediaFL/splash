@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/split_reduce.h"
 
@@ -1551,5 +1552,29 @@ kernel void decode_accept_dflash(
   } else {
     accept_greedy_lane(lane_draft, lane_target, retained[batch],
                        accepted_count[batch], lane_params);
+  }
+}
+
+kernel void decode_argmax_accept_greedy(
+    device const float *partial_values [[buffer(0)]],
+    device const uint *partial_indices [[buffer(1)]],
+    device const uint *draft_tokens [[buffer(2)]],
+    device uint *target_tokens [[buffer(3)]],
+    device uint *retained [[buffer(4)]],
+    device uint *accepted_count [[buffer(5)]],
+    constant AcceptBatchParams &params [[buffer(6)]],
+    uint batch [[threadgroup_position_in_grid]],
+    uint row [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  const uint selected = argmax_reduce(partial_values, partial_indices,
+                                      batch * SPLASH_TARGET_VERIFY_ROWS + row, lane);
+  if (lane == 0)
+    target_tokens[batch * SPLASH_TARGET_VERIFY_ROWS + row] = selected;
+  threadgroup_barrier(mem_flags::mem_device);
+  if (row == 0 && lane == 0) {
+    const AcceptParams laneParams{params.remaining[batch], params.stop_token_0, params.stop_token_1};
+    accept_greedy_lane(draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS,
+                       target_tokens + batch * SPLASH_TARGET_VERIFY_ROWS,
+                       retained[batch], accepted_count[batch], laneParams);
   }
 }

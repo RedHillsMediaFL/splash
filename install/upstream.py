@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 """Install supported upstream models: a target repository and the draft
 trained for its architecture, as an assembly (assembly.py).
 
@@ -36,6 +37,7 @@ TOKENIZER_FILES = (
     "added_tokens.json",
     "special_tokens_map.json",
 )
+PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
 
 
 @dataclass(frozen=True)
@@ -206,17 +208,16 @@ def _gguf_target(repo, variant, language_only, scratch):
 
 def _mlx_target(repo, language_only):
     required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
-    if not language_only:
-        required.add("preprocessor_config.json")
-    if missing := required - repo.files:
-        # --language-only drops the processor requirement and no other.
-        hint = (
-            "; use --language-only to serve text only"
-            if missing == {"preprocessor_config.json"}
-            else ""
-        )
+    missing = sorted(required - repo.files)
+    processor = language_only or any(
+        filename in repo.files for filename in PROCESSOR_FILES
+    )
+    if missing or not processor:
+        hint = "" if missing else "; use --language-only to serve text only"
+        if not processor:
+            missing.append(" or ".join(PROCESSOR_FILES))
         raise models.ModelError(
-            f"target repository {repo.name} is missing: {', '.join(sorted(missing))}. "
+            f"target repository {repo.name} is missing: {', '.join(missing)}. "
             "Configuration, tokenizer and processor must come from the target "
             f"repository{hint}."
         )
@@ -229,7 +230,7 @@ def _mlx_target(repo, language_only):
     files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
     vision_format = "none"
     if not language_only:
-        _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
+        _validate_processor(_image_processor(repo))
         shards = _weight_files(repo, "vision_tower.")
         if not shards:
             raise models.ModelError(
@@ -241,6 +242,19 @@ def _mlx_target(repo, language_only):
         files |= {"vision/" + n: n for n in shards}
     files |= {"target/" + n: n for n in _weight_files(repo)}
     return Target("mlx-affine", vision_format, config, None, family, files)
+
+
+def _image_processor(repo):
+    """Read the target's image processor, preferring its legacy metadata file."""
+    if "preprocessor_config.json" in repo.files:
+        return models.read_json(repo.file("preprocessor_config.json"))
+    config = models.read_json(repo.file("processor_config.json")).get("image_processor")
+    if not isinstance(config, dict):
+        raise models.ModelError(
+            f"{repo.name}'s processor_config.json has no image_processor; "
+            "use --language-only to serve text only"
+        )
+    return config
 
 
 def _weight_files(repo, prefix=""):
@@ -336,6 +350,18 @@ def prepare(selection):
         _start_installed(selection, target, installed)
     else:
         _install_commit(selection, target, installed)
+
+
+def install_local(selection, target_directory, draft_directory):
+    """Install local target and draft checkpoints into an isolated selection."""
+    if selection.variant is not None or selection.revision is not None:
+        raise models.ModelError(
+            "a local staging selection cannot use a variant or revision"
+        )
+    target = hub.Repository.local_directory(Path(target_directory).resolve())
+    draft = hub.Repository.local_directory(Path(draft_directory).resolve())
+    _install(selection, target, None, draft)
+    return selection.link
 
 
 def _is_legacy_package(repo, model):

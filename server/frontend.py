@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 """Prepare API requests for generation and manage Responses history."""
 
 import hashlib
@@ -26,6 +27,7 @@ from .chat_templates import (
     render_chat_template,
     template_options,
 )
+from .constraints import ReasoningBudgetConstraint
 from .diagnostics import print_status
 from .errors import (
     APIError,
@@ -36,8 +38,9 @@ from .errors import (
 from .latency import LatencyMetrics
 from .lru import LRUCache
 from .metrics import is_finite_number
+from .reasoning import effective_effort, effort_messages, reasoning_budget
 from .serve_options import REASONING_EFFORTS, parse_served_model_name
-from .tokenization import PromptTokenizer
+from .tokenization import PromptTokenizer, tokenizable
 from .tool_schema import (
     THINK_END,
     THINK_END_TOKEN_ID,
@@ -802,6 +805,9 @@ class Frontend:
                 body.get("messages"), vision=self.vision, deadline=deadline
             )
         )
+        messages = effort_messages(
+            messages, effective_effort(reasoning_effort, enable_thinking)
+        )
         tools, tool_policy = normalize_tools(
             body.get("tools"),
             body.get("tool_choice"),
@@ -825,7 +831,7 @@ class Frontend:
 
     def _tokenize(self, text, **options):
         with self.latencies.measure("tokenization"):
-            return self.tokenizer(text, **options)
+            return self.tokenizer(tokenizable(text), **options)
 
     def _apply_chat_template(self, messages, template):
         with self.latencies.measure("template"):
@@ -1005,12 +1011,25 @@ class Frontend:
         max_new = self._output_budget(
             requested, prompt_tokens, output_field, clamp_output_budget
         )
+        effort = effective_effort(prompt.reasoning_effort, prompt.enable_thinking)
+        effort = effort if thinking else "none"
+        budget = reasoning_budget(effort, thinking, max_new)
+        if budget is not None:
+            constraint = ReasoningBudgetConstraint(budget.effective_tokens, constraint)
         return self._generation_job(
             options,
             prompt_tokens,
             max_new,
             deadline,
             thinking=thinking,
+            reasoning_effort=effort,
+            reasoning_requested_budget_tokens=budget.requested_tokens
+            if budget
+            else None,
+            reasoning_budget_tokens=budget.effective_tokens if budget else None,
+            reasoning_answer_reserve_tokens=budget.answer_reserve_tokens
+            if budget
+            else 0,
             thinking_display=thinking_display,
             tool_policy=tool_policy,
             response_validator=response_validator,

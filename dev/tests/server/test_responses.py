@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 import json
 import unittest
 
@@ -14,6 +15,7 @@ from dev.tests.server_fixtures import (
 )
 from server import api_shapes
 from server.api_shapes import _namespace_alias, normalize_responses_input
+from server.reasoning import reasoning_instruction
 
 
 class ResponsesTests(HarnessTestCase):
@@ -61,12 +63,26 @@ class ResponsesTests(HarnessTestCase):
                     "cache_write_tokens": 1,
                 },
                 "output_tokens": 3,
-                "output_tokens_details": {"reasoning_tokens": 3},
+                "output_tokens_details": {
+                    "reasoning_tokens": 3,
+                    "reasoning_effort": "medium",
+                    "reasoning_requested_budget_tokens": 256,
+                    "reasoning_budget_tokens": 5,
+                    "reasoning_budget_clamped": True,
+                    "answer_reserve_tokens": 2,
+                    "reasoning_budget_exhausted": False,
+                },
                 "total_tokens": 5,
             },
         )
         rendered, kwargs = harness.tokenizer.templates[-1]
-        self.assertEqual(rendered[0], {"role": "system", "content": "Be concise."})
+        self.assertEqual(
+            rendered[0],
+            {
+                "role": "system",
+                "content": "Be concise.\n\n" + reasoning_instruction("medium"),
+            },
+        )
         self.assertEqual(rendered[1]["content"], "hello")
         self.assertEqual(kwargs["reasoning_effort"], "medium")
         self.assertEqual(

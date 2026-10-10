@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
@@ -6,6 +7,7 @@
 #include "model/Model.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/RowCopy.hpp"
+#include "ops/Sampling.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -14,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -144,6 +147,102 @@ void runWidth(MetalBackend &backend, uint32_t width,
 // outside the destination region keeps its poison, and regions past a row are
 // refused. Each buffer holds its region at its extent, the end of its last
 // row's values, and is refused one value short.
+void testFusedGreedy(MetalBackend &backend, uint32_t width,
+                     const std::array<uint32_t, kLanes> &acceptedReference,
+                     const std::array<uint32_t, kLanes> &remainingReference,
+                     uint32_t stopLane = kLanes, uint32_t stopRow = 0,
+                     bool excludesStops = false, bool invalidRow = false) {
+  constexpr uint32_t vocabulary = 128;
+  constexpr uint32_t stopToken = 126;
+  const uint32_t rows = width * kRows;
+  const splash::ops::Sampling sampling(vocabulary);
+  const auto workspace = splash::ops::Sampling::workspace(rows);
+  splash::ops::SamplingBuffers buffers;
+  buffers.logits = shared(backend, uint64_t{rows} * vocabulary * sizeof(float), "fused-logits");
+  buffers.argmaxValues = shared(backend, workspace.argmaxValuesBytes, "fused-values");
+  buffers.argmaxIndices = shared(backend, workspace.argmaxIndicesBytes, "fused-indices");
+  buffers.outputTokens = shared(backend, rows * sizeof(uint32_t), "fused-output");
+  buffers.constraintMasks = shared(backend, width * (kRows + 1) * 16, "fused-masks");
+  splash::ops::AcceptanceBuffers acceptance;
+  acceptance.proposedTokens = shared(backend, width * kProposals * sizeof(uint32_t), "fused-proposals");
+  acceptance.candidates = shared(backend, width * kProposals * SPLASH_DRAFT_CANDIDATES * sizeof(uint32_t), "fused-candidates");
+  acceptance.proposalProbabilities = shared(backend, width * kProposals * SPLASH_DRAFT_CANDIDATES * sizeof(float), "fused-probabilities");
+  acceptance.targetVocabularyRows = shared(backend, workspace.vocabularyRowsBytes, "fused-target-rows");
+  acceptance.uniforms = shared(backend, width * SPLASH_SAMPLING_UNIFORMS * sizeof(float), "fused-uniforms");
+  acceptance.outputTokens = buffers.outputTokens;
+  acceptance.retainedCounts = shared(backend, width * sizeof(uint32_t), "fused-retained");
+  acceptance.acceptedCounts = shared(backend, width * sizeof(uint32_t), "fused-accepted");
+  auto *logits = contents<float>(buffers.logits);
+  std::fill_n(logits, rows * vocabulary, -1.0F);
+  std::array<splash::ops::SamplingPolicy, kLanes> policies{};
+  auto *draft = contents<uint32_t>(acceptance.proposedTokens);
+  for (uint32_t lane = 0; lane < width; ++lane) {
+    policies[lane].excludesStopTokens = excludesStops;
+    for (uint32_t row = 0; row < kRows; ++row) {
+      const uint32_t proposal = 20 + lane * 12 + row;
+      uint32_t target = row < acceptedReference[lane] ? proposal : 80 + row;
+      if (lane == stopLane && row == stopRow)
+        target = stopToken;
+      if (row < kProposals)
+        draft[lane * kProposals + row] = row < acceptedReference[lane] ? target : proposal;
+      float *rowLogits = logits + (lane * kRows + row) * vocabulary;
+      rowLogits[target] = 2.0F;
+      if (target < 110)
+        rowLogits[110] = 2.0F;
+    }
+  }
+  if (invalidRow)
+    std::fill_n(logits, vocabulary, std::numeric_limits<float>::quiet_NaN());
+  const auto activePolicies = std::span(policies).first(width);
+  const auto maximumRetained = std::span(remainingReference).first(width);
+  CommandGraph reference;
+  sampling.addVerify(reference, activePolicies, buffers, stopToken, 127, {});
+  sampling.addAcceptance(reference, acceptance, maximumRetained, activePolicies, stopToken, 127);
+  static_cast<void>(backend.submitCommandAsync(reference.dispatches()).wait());
+  const auto *referenceOutput = contents<uint32_t>(buffers.outputTokens);
+  const std::vector<uint32_t> output(referenceOutput, referenceOutput + rows);
+  const auto *referenceRetained = contents<uint32_t>(acceptance.retainedCounts);
+  const std::vector<uint32_t> retained(referenceRetained, referenceRetained + width);
+  const auto *referenceAccepted = contents<uint32_t>(acceptance.acceptedCounts);
+  const std::vector<uint32_t> accepted(referenceAccepted, referenceAccepted + width);
+  std::fill_n(contents<uint32_t>(buffers.outputTokens), rows, 0xDEADBEEFu);
+  std::fill_n(contents<uint32_t>(acceptance.retainedCounts), width, 0xDEADBEEFu);
+  std::fill_n(contents<uint32_t>(acceptance.acceptedCounts), width, 0xDEADBEEFu);
+  CommandGraph fused;
+  sampling.addGreedyVerifyAndAcceptance(fused, buffers, acceptance, maximumRetained,
+                                        activePolicies, stopToken, 127);
+  require(reference.dispatches().size() == 3 && fused.dispatches().size() == 2,
+          "greedy fusion must remove one dispatch");
+  static_cast<void>(backend.submitCommandAsync(fused.dispatches()).wait());
+  require(std::equal(output.begin(), output.end(), contents<uint32_t>(buffers.outputTokens)),
+          "fused greedy output differs from ordinary policy");
+  require(std::equal(retained.begin(), retained.end(), contents<uint32_t>(acceptance.retainedCounts)),
+          "fused greedy retention differs from ordinary policy");
+  require(std::equal(accepted.begin(), accepted.end(), contents<uint32_t>(acceptance.acceptedCounts)),
+          "fused greedy acceptance differs from ordinary policy");
+  for (const uint32_t mutation : {0u, 1u, 2u}) {
+    auto invalidPolicies = policies;
+    if (mutation == 0)
+      invalidPolicies[0].temperature = 1.0F;
+    else if (mutation == 1)
+      invalidPolicies[0].constrained = true;
+    else
+      invalidPolicies[0].penalties.repetition = 1.2F;
+    CommandGraph invalid;
+    rejects([&] { sampling.addGreedyVerifyAndAcceptance(invalid, buffers, acceptance, maximumRetained,
+                                                       std::span(invalidPolicies).first(width), stopToken, 127); },
+            "invalid fused greedy lane", "unsupported fused policy must be refused");
+    require(invalid.dispatches().empty(), "invalid fused policy encoded a partial graph");
+  }
+  requireExtent(backend, acceptance.outputTokens, rows * sizeof(uint32_t), sizeof(uint32_t),
+                "target token", [&](CommandGraph &graph, const MetalBuffer &view) {
+                  auto changed = acceptance;
+                  changed.outputTokens = view;
+                  sampling.addGreedyVerifyAndAcceptance(graph, buffers, changed, maximumRetained,
+                                                        activePolicies, stopToken, 127);
+                });
+}
+
 void testRowCopy(MetalBackend &backend) {
   constexpr uint16_t kPoison = 0xA5A5;
   const auto check = [&](uint32_t sourceRows, RowRegion from,
@@ -237,6 +336,9 @@ int main(int argc, char **argv) {
     for (uint32_t width = 1; width <= kLanes; ++width) {
       runWidth(backend, width, lowerAccepted, fullRemaining);
       runWidth(backend, width, upperAccepted, fullRemaining);
+      testFusedGreedy(backend, width, lowerAccepted, fullRemaining);
+      testFusedGreedy(backend, width, upperAccepted, fullRemaining);
+      testFusedGreedy(backend, width, upperAccepted, fullRemaining, kLanes, 0, false, true);
     }
 
     // Output limits and stop tokens shorten the committed prefix without
@@ -245,6 +347,8 @@ int main(int argc, char **argv) {
     constexpr std::array<uint32_t, kLanes> allAccepted{7, 7, 7, 7};
     constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8};
     runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3);
+    testFusedGreedy(backend, kLanes, allAccepted, shortRemaining, 3, 3);
+    testFusedGreedy(backend, kLanes, allAccepted, shortRemaining, 3, 3, true);
     testRowCopy(backend);
     verifyInputExtents(backend);
     std::cout << "dflash_batch_control_metal_test: PASS\n";

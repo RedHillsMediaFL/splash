@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 ENGINE_TEST_BUILD := $(BUILD)/engine-tests
 ENGINE_TEST_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev \
 	$(MACOS_TARGET_FLAG)
@@ -87,6 +88,7 @@ MODEL_CONFIGS := dev/tests/fixtures/model-configs
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
 TEST_ENGINE_CACHE_TEST := $(ENGINE_TEST_BUILD)/engine-cache
 TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
+TEST_PROMPT_LOOKUP := $(ENGINE_TEST_BUILD)/prompt-lookup
 TEST_RAGGED_SCHEDULER_TEST := $(ENGINE_TEST_BUILD)/ragged-scheduler
 TEST_ENGINE_TEST := $(ENGINE_TEST_BUILD)/engine
 TEST_ELASTIC_KV_TEST := $(ENGINE_TEST_BUILD)/elastic-kv-pool
@@ -180,6 +182,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_CACHE_DIRECTORY) $(TEST_VISION_PREP
 	$(TEST_ENGINE_CACHE_TEST) \
 	$(TEST_PERSISTENT_CACHE) \
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST) \
+	$(TEST_PROMPT_LOOKUP) \
 	$(TEST_RAGGED_SCHEDULER_TEST) \
 	$(TEST_ENGINE_TEST) \
 	$(TEST_ELASTIC_KV_TEST) \
@@ -280,6 +283,7 @@ $(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
 $(TEST_DRAFT_CONTEXT_PLAN_TEST): runtime/model/DraftContextPlan.cpp \
 		dev/benchmarks/PrefillWork.hpp \
 		dev/tests/engine/draft_context_plan_test.cpp
+$(TEST_PROMPT_LOOKUP): runtime/model/PromptLookup.hpp dev/tests/engine/prompt_lookup_test.cpp
 $(TEST_RAGGED_SCHEDULER_TEST): runtime/engine/Scheduler.cpp \
 		dev/tests/engine/ragged_scheduler_test.cpp
 $(TEST_ELASTIC_KV_TEST): runtime/engine/KvPool.cpp \
@@ -302,7 +306,7 @@ $(TEST_STATUS_TEST): runtime/metal/DeviceCapabilities.cpp \
 $(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc
 
 $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE_TEST) \
-		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_RAGGED_SCHEDULER_TEST) \
+		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_PROMPT_LOOKUP) $(TEST_RAGGED_SCHEDULER_TEST) \
 		$(TEST_ELASTIC_KV_TEST) $(TEST_NATIVE_LOOP_TEST) $(TEST_METRICS_TEST) \
 		$(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_GOVERNOR_TEST) $(TEST_STATUS_TEST) \
 		$(TEST_Q8_CPU_TEST) $(TEST_SLOT_FILE) $(TEST_CACHE_DIRECTORY) \
@@ -538,6 +542,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
 	$(TEST_ENGINE_CACHE_TEST)
 	$(TEST_PERSISTENT_CACHE)
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST)
+	$(TEST_PROMPT_LOOKUP)
 	$(TEST_RAGGED_SCHEDULER_TEST)
 	$(TEST_ENGINE_TEST)
 	$(TEST_ELASTIC_KV_TEST)

@@ -1,5 +1,7 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "model/Runtime.hpp"
 #include "AwakeClock.hpp"
+#include "model/PromptLookup.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -21,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <list>
 #include <numeric>
@@ -240,6 +243,7 @@ struct Runtime::Impl {
     // RequestFlag bits.
     uint32_t flags = 0;
     std::optional<uint32_t> pendingToken;
+    PromptLookup promptLookup;
     // A constrained request's final prompt row, held from its prompt's end
     // until its first token is selected under its first mask, suspensions
     // included. Composite cache state never stores it; every cache hit
@@ -269,6 +273,7 @@ struct Runtime::Impl {
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
     uint32_t maximumRetained = 0;
+    bool promptLookup = false;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -327,6 +332,14 @@ struct Runtime::Impl {
   QwenTarget targetModel;
   DFlashDraft draftModel;
   ops::AneFfn *aneFfn;
+  const bool promptLookupEnabled = [] {
+    const char *value = std::getenv("SPLASH_PROMPT_LOOKUP");
+    return !value || std::string_view(value) != "0";
+  }();
+  const bool fusedGreedyEnabled = [] {
+    const char *value = std::getenv("SPLASH_FUSED_GREEDY");
+    return !value || std::string_view(value) != "0";
+  }();
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -352,6 +365,8 @@ struct Runtime::Impl {
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable =
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
+    counters.promptLookupEnabled = promptLookupEnabled;
+    counters.fusedGreedyEnabled = fusedGreedyEnabled;
     preparePolicyPipelines();
   }
 
@@ -377,6 +392,13 @@ struct Runtime::Impl {
     sampling.addVerify(graph, policies, samplingBuffers(2),
                        geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1], penalties);
+    if (fusedGreedyEnabled) {
+      const std::array<ops::SamplingPolicy, 2> greedyPolicies{};
+      const std::array<uint32_t, 2> maximumRetained{kDecodeRows, kDecodeRows};
+      sampling.addGreedyVerifyAndAcceptance(
+          graph, samplingBuffers(2), acceptanceBuffers(2), maximumRetained,
+          greedyPolicies, geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
+    }
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -1541,9 +1563,21 @@ struct Runtime::Impl {
                                 std::span(startPositions).first(lanes));
   }
 
+  ops::AcceptanceBuffers acceptanceBuffers(uint32_t width) const {
+    return {decodeArena->batchSlice(DecodeTensor::ProposedTokens, width),
+            decodeArena->batchSlice(DecodeTensor::Candidates, width),
+            decodeArena->batchSlice(DecodeTensor::ProposalProbs, width),
+            decodeArena->batchSlice(DecodeTensor::TargetVocabularyRows, width),
+            decodeArena->batchSlice(DecodeTensor::SamplingUniforms, width),
+            decodeArena->batchSlice(DecodeTensor::OutputTokens, width),
+            decodeArena->batchSlice(DecodeTensor::RetainedCount, width),
+            decodeArena->batchSlice(DecodeTensor::AcceptedCount, width)};
+  }
+
   void encodeBatchAcceptance(CommandGraph &graph,
                              std::span<Request *const> lanes,
-                             std::span<const uint32_t> maximumRetained) {
+                             std::span<const uint32_t> maximumRetained,
+                             bool fusedGreedy = false) {
     if (lanes.empty() || lanes.size() > kLaneCount ||
         lanes.size() != maximumRetained.size()) {
       throw std::invalid_argument("invalid DFlash acceptance batch");
@@ -1557,18 +1591,15 @@ struct Runtime::Impl {
       policies[lane] = samplingPolicy(*lanes[lane]);
     }
     const uint32_t width = static_cast<uint32_t>(lanes.size());
-    sampling.addAcceptance(
-        graph,
-        {decodeArena->batchSlice(DecodeTensor::ProposedTokens, width),
-         decodeArena->batchSlice(DecodeTensor::Candidates, width),
-         decodeArena->batchSlice(DecodeTensor::ProposalProbs, width),
-         decodeArena->batchSlice(DecodeTensor::TargetVocabularyRows, width),
-         decodeArena->batchSlice(DecodeTensor::SamplingUniforms, width),
-         decodeArena->batchSlice(DecodeTensor::OutputTokens, width),
-         decodeArena->batchSlice(DecodeTensor::RetainedCount, width),
-         decodeArena->batchSlice(DecodeTensor::AcceptedCount, width)},
-        maximumRetained, std::span(policies).first(width),
-        geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
+    if (fusedGreedy) {
+      sampling.addGreedyVerifyAndAcceptance(
+          graph, samplingBuffers(width), acceptanceBuffers(width), maximumRetained,
+          std::span(policies).first(width), geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
+    } else {
+      sampling.addAcceptance(
+          graph, acceptanceBuffers(width), maximumRetained, std::span(policies).first(width),
+          geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
+    }
   }
 
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
@@ -1685,6 +1716,14 @@ struct Runtime::Impl {
                               nextLength, items[lane].logicalPosition,
                               nextLength, false));
       entry.generatedTokens += laneResult.retained;
+      entry.promptLookup.observe(output);
+      if (laneResult.promptLookup) {
+        entry.promptLookup.feedback(laneResult.accepted);
+        ++counters.promptLookupBatches;
+        counters.promptLookupProposedTokens += kDraftProposalTokens;
+        counters.promptLookupAcceptedTokens +=
+            std::min(laneResult.accepted, laneResult.retained - 1);
+      }
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
@@ -1985,6 +2024,9 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.images = std::move(images);
   entry.restoredTokens = request.restoredTokens;
   impl_->bindPenalties(entry, request.prompt);
+  if (impl_->promptLookupEnabled && entry.constraint == ConstraintMode::None &&
+      request.images.empty() && request.scoreTokens.empty())
+    entry.promptLookup.reset(request.prompt);
   auto [_, inserted] = impl_->requests.emplace(request.id, std::move(entry));
   if (!inserted) {
     throw std::logic_error("request insertion lost uniqueness");
@@ -2309,10 +2351,35 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                              DecodeTensor::DraftHidden0, width);
-  impl_->encodeDraftBatchGraph(commandGraph, entries,
-                               {logicalPositions.data(), width});
+  std::array<std::array<uint32_t, kDraftProposalTokens>, kLaneCount> lookup{};
+  bool useLookup = impl_->promptLookupEnabled && !constrained;
+  if (useLookup) {
+    for (uint32_t lane = 0; lane < width; ++lane)
+      useLookup &= entries[lane]->promptLookup.propose(lanes[lane].currentAnchor, lookup[lane]);
+  }
+  if (useLookup) {
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      lanes[lane].promptLookup = true;
+      std::copy(lookup[lane].begin(), lookup[lane].end(),
+                contents<uint32_t>(impl_->decodeArena->get(lane, DecodeTensor::ProposedTokens),
+                                   "lookup proposals"));
+      auto *ids = contents<uint32_t>(impl_->decodeArena->get(lane, DecodeTensor::Candidates),
+                                     "lookup candidates");
+      auto *probabilities = contents<float>(impl_->decodeArena->get(lane, DecodeTensor::ProposalProbs),
+                                           "lookup probabilities");
+      for (uint32_t row = 0; row < kDraftProposalTokens; ++row) {
+        std::fill_n(ids + row * SPLASH_DRAFT_CANDIDATES, SPLASH_DRAFT_CANDIDATES, UINT32_MAX);
+        std::fill_n(probabilities + row * SPLASH_DRAFT_CANDIDATES, SPLASH_DRAFT_CANDIDATES, 0.0F);
+        ids[row * SPLASH_DRAFT_CANDIDATES] = lookup[lane][row];
+        probabilities[row * SPLASH_DRAFT_CANDIDATES] = 1.0F;
+      }
+    }
+  } else {
+    impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
+                                DecodeTensor::DraftHidden0, width);
+    impl_->encodeDraftBatchGraph(commandGraph, entries,
+                                 {logicalPositions.data(), width});
+  }
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
         *impl_, std::move(lanes), items, commandGraph, std::move(completion));
@@ -2321,9 +2388,15 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                               DecodeTensor::Hidden0, width);
   impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items);
-  impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries);
+  const bool fusedGreedy = impl_->fusedGreedyEnabled &&
+      std::all_of(entries.begin(), entries.end(), [](const auto *entry) {
+        return !Impl::samplingEnabled(*entry) && entry->constraint == ConstraintMode::None &&
+               !Impl::samplingPenalties(*entry).active();
+      });
+  if (!fusedGreedy)
+    impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries);
   impl_->encodeBatchAcceptance(commandGraph, entries,
-                               {maximumRetained.data(), width});
+                               {maximumRetained.data(), width}, fusedGreedy);
   impl_->encodeBatchGdnCommit(commandGraph, entries);
   impl_->encodeDraftStateCommitBatch(commandGraph, entries, items);
 

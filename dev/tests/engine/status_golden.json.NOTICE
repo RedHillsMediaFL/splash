@@ -1,0 +1,3 @@
+Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
+The generated status fixture includes prompt-lookup and fused-greedy telemetry.
+This adjacent notice preserves the fixture's valid JSON and exact-byte contract.

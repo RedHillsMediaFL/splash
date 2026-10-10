@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #pragma once
 
 #include "ops/PagedKv.hpp"
@@ -447,6 +448,11 @@ struct ModelTelemetry final {
   uint64_t draftStateResets = 0;
   uint64_t imageEncodes = 0;
   uint64_t imageEmbeddingReuses = 0;
+  bool promptLookupEnabled = false;
+  bool fusedGreedyEnabled = false;
+  uint64_t promptLookupBatches = 0;
+  uint64_t promptLookupProposedTokens = 0;
+  uint64_t promptLookupAcceptedTokens = 0;
   // The vision encoder's scratch while it exists, the encoded rows the
   // embedding cache keeps for reuse, those states in RAM hold to resume
   // inside an image, and every image's rows anything holds, each counted

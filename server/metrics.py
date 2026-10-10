@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 """Usage, metrics and Prometheus text rendering for request results."""
 
 from __future__ import annotations
@@ -213,13 +214,30 @@ def prometheus_metrics(status):
     return "\n".join(lines) + "\n"
 
 
+def reasoning_details(job):
+    details = {"reasoning_tokens": job.reasoning_tokens}
+    if job.reasoning_effort is not None:
+        details["reasoning_effort"] = job.reasoning_effort
+    if job.reasoning_budget_tokens is not None:
+        details.update(
+            reasoning_requested_budget_tokens=job.reasoning_requested_budget_tokens,
+            reasoning_budget_tokens=job.reasoning_budget_tokens,
+            reasoning_budget_clamped=(
+                job.reasoning_budget_tokens < job.reasoning_requested_budget_tokens
+            ),
+            answer_reserve_tokens=job.reasoning_answer_reserve_tokens,
+            reasoning_budget_exhausted=job.constraint.budget_exhausted,
+        )
+    return details
+
+
 def usage_dict(result, job):
     return {
         "prompt_tokens": result.prompt_tokens,
         "completion_tokens": result.completion_tokens,
         "total_tokens": result.prompt_tokens + result.completion_tokens,
         "prompt_tokens_details": {"cached_tokens": result.cache.matched_tokens},
-        "completion_tokens_details": {"reasoning_tokens": job.reasoning_tokens},
+        "completion_tokens_details": reasoning_details(job),
     }
 
 

@@ -1,7 +1,11 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "ops/ExecutionPlans.hpp"
 
 #include <algorithm>
+#include <charconv>
+#include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 
 namespace splash::ops {
 namespace {
@@ -9,6 +13,31 @@ namespace {
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kDecodeRows = SPLASH_TARGET_VERIFY_ROWS;
 static_assert(kMaximumLanes == 4);
+
+uint32_t m1PrefillMoeM8MaxRows(const DeviceCapabilities &device) {
+  if (!DeviceCapabilities::isM1Ultra(device.hardwareAppleGpuFamily, device.gpuCoreCount))
+    return 0;
+  const char *value = std::getenv("SPLASH_M1_PREFILL_MOE_M8_MAX_ROWS");
+  if (!value || !*value)
+    return 0;
+  const std::string_view text(value);
+  uint32_t rows = 0;
+  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), rows);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || rows > SPLASH_PREFILL_TOKEN_BUDGET)
+    throw std::invalid_argument("SPLASH_M1_PREFILL_MOE_M8_MAX_ROWS must be an integer from 0 to 2048");
+  return rows;
+}
+
+bool m1AttentionFlag(const DeviceCapabilities &device, const char *name, bool fallback) {
+  if (!DeviceCapabilities::isM1Ultra(device.hardwareAppleGpuFamily, device.gpuCoreCount))
+    return false;
+  const char *value = std::getenv(name);
+  if (!value || !*value) return fallback;
+  const std::string_view text(value);
+  if (text == "0") return false;
+  if (text == "1") return true;
+  throw std::invalid_argument(std::string(name) + " must be 0 or 1");
+}
 
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,
@@ -25,17 +54,21 @@ void include(Workspace &bound, const Workspace &required,
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
     : linear_(device), moeRouteWideRows_(moeRouteWideRows(plannedGpuCores(device))),
-      family_(gpuFamilyClass(device.appleGpuFamily)) {}
+      family_(gpuFamilyClass(device.appleGpuFamily)),
+      m1Ultra_(DeviceCapabilities::isM1Ultra(device.hardwareAppleGpuFamily, device.gpuCoreCount)),
+      m1PrefillMoeM8MaxRows_(m1PrefillMoeM8MaxRows(device)),
+      m1AttentionRegister_(m1AttentionFlag(device, "SPLASH_M1_ATTN_SGF", true)),
+      m1AttentionReuse2_(m1AttentionFlag(device, "SPLASH_M1_PREFILL_ATTN_REUSE2", false)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::prefillPlan(rows, queryHeads, layout);
+  return PagedAttention::prefillPlan(rows, queryHeads, layout, m1AttentionRegister_, m1AttentionReuse2_);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens);
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, m1AttentionRegister_);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
@@ -50,7 +83,11 @@ MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phas
   MoeConfig config;
   config.routeWideRows = moeRouteWideRows_;
   config.expertTile = prefill ? MoeExpertTile::M32 : MoeExpertTile::M8;
+  if (m1Ultra_ && shape.weightLayout == WeightLayout::Affine64)
+    config.kernel = MoeExpertKernel::M1Register;
   if (!prefill) config.m8Simdgroups = moeDecodeSimdgroups(family_);
+  if (prefill && shape.weightLayout == WeightLayout::Affine64 && m1Ultra_ && rows <= m1PrefillMoeM8MaxRows_)
+    config.expertTile = MoeExpertTile::M8;
   if (shape.weightLayout == WeightLayout::Block32) {
     const MoeGgufTile tile = moeGgufTile(family_, shape);
     if (prefill) config.expertTile = moeGgufPrefillTile(shape, rows, tile);

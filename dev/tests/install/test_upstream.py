@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 import contextlib
 import dataclasses
 import errno
@@ -489,6 +490,11 @@ class UpstreamTest(unittest.TestCase):
                     "use --language-only to serve text only" in str(refused.exception),
                     missing == "preprocessor_config.json",
                 )
+                self.assertEqual(
+                    "preprocessor_config.json or processor_config.json"
+                    in str(refused.exception),
+                    missing == "preprocessor_config.json",
+                )
                 self.assertEqual(fake.downloads, [])
                 self.assertFalse(chosen.models_root.exists())
                 shutil.rmtree(fake.remote)
@@ -588,6 +594,96 @@ class UpstreamTest(unittest.TestCase):
                 ),
             ):
                 self.prepare(selection(self.root, model, language_only=False))
+
+    def test_mlx_vision_reads_the_image_processor_of_processor_config(self):
+        fake = fake_hub(self, self.cache)
+        for family in (DENSE, MOE):
+            for name, processor, refusal in (
+                (
+                    "vision",
+                    {"image_processor": PROCESSOR, "video_processor": PROCESSOR},
+                    None,
+                ),
+                (
+                    "video",
+                    {"video_processor": PROCESSOR},
+                    "processor_config.json has no image_processor; use --language-only",
+                ),
+                (
+                    "non-object",
+                    {"image_processor": []},
+                    "processor_config.json has no image_processor; use --language-only",
+                ),
+                (
+                    "other-patches",
+                    {"image_processor": PROCESSOR | {"patch_size": 14}},
+                    "unsupported vision preprocessing configuration",
+                ),
+            ):
+                model = f"someone/{family.name}-{name}"
+
+                def target(root):
+                    mlx_target(root, family)
+                    (root / "model.safetensors").unlink()
+                    shards = {
+                        "vision_tower.blocks.0.attn.qkv.weight": "model-00001-of-00002.safetensors",
+                        "language_model.lm_head.weight": "model-00002-of-00002.safetensors",
+                    }
+                    (root / "model.safetensors.index.json").write_text(
+                        json.dumps({"weight_map": shards})
+                    )
+                    for shard in set(shards.values()):
+                        (root / shard).write_text(shard)
+                    (root / "processor_config.json").write_text(json.dumps(processor))
+
+                with self.subTest(model=model):
+                    fake.publish(model, "a" * 40, target)
+                    chosen = selection(self.root, model, language_only=False)
+                    if refusal is None:
+                        self.prepare(chosen)
+                        self.assertEqual(
+                            assembly.verify(chosen.link)["vision_format"], "safetensors"
+                        )
+                    else:
+                        with self.assertRaisesRegex(models.ModelError, refusal):
+                            self.prepare(chosen)
+                        self.assertNotIn(
+                            f"{model}/model-00001-of-00002.safetensors", fake.downloads
+                        )
+                        self.assertNotIn(
+                            f"{model}/model-00002-of-00002.safetensors", fake.downloads
+                        )
+
+    def test_mlx_vision_prefers_the_legacy_processor_file(self):
+        target = mlx_target(self.root / "local-target", MOE)
+        (target / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
+        (target / "processor_config.json").write_text("not JSON")
+        repository = hub.Repository.local_directory(target)
+        self.assertEqual(upstream._image_processor(repository), PROCESSOR)
+        (target / "preprocessor_config.json").write_text(
+            json.dumps(PROCESSOR | {"patch_size": 14})
+        )
+        (target / "processor_config.json").write_text(
+            json.dumps({"image_processor": PROCESSOR})
+        )
+        with self.assertRaisesRegex(
+            models.ModelError, "unsupported vision preprocessing configuration"
+        ):
+            upstream._validate_processor(upstream._image_processor(repository))
+
+    def test_language_only_does_not_read_processor_config(self):
+        def target(root):
+            mlx_target(root, MOE)
+            (root / "processor_config.json").write_text("not JSON")
+
+        fake = fake_hub(self, self.cache)
+        model = "someone/text-only-moe"
+        fake.publish(model, "a" * 40, target)
+        chosen = selection(self.root, model)
+        self.prepare(chosen)
+        self.assertEqual(assembly.verify(chosen.link)["vision_format"], "none")
+        self.assertNotIn(f"{model}/processor_config.json", fake.downloads)
+        self.assertNotIn(f"{model}/processor_config.json", fake.range_reads)
 
     def test_a_shard_name_read_as_a_glob_is_never_downloaded(self):
         def target(root):

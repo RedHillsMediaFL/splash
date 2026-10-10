@@ -1,3 +1,4 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 import io
 import json
 import os
@@ -137,7 +138,11 @@ class ThinkingKeyTests(unittest.TestCase):
             status, _, payload = second.request("POST", path, body)
             self.assertEqual(status, 200, payload)
             self.assertEqual(
-                second.tokenizer.templates[-1][0][1]["reasoning_content"],
+                next(
+                    message
+                    for message in second.tokenizer.templates[-1][0]
+                    if message["role"] == "assistant"
+                )["reasoning_content"],
                 "because ",
             )
 

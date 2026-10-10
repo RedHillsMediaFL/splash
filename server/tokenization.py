@@ -1,11 +1,20 @@
+# Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 """Bounded token reuse at literal chat-message boundaries."""
 
 import json
+import re
 import sys
 import threading
 from array import array
 
 from .lru import LRUCache
+
+
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def tokenizable(text):
+    return _SURROGATE.sub("\ufffd", text)
 
 
 class PromptTokenizer:
@@ -72,7 +81,7 @@ class PromptTokenizer:
         )
 
     def _encode(self, text):
-        return self.tokenizer(text, add_special_tokens=False)["input_ids"]
+        return self.tokenizer(tokenizable(text), add_special_tokens=False)["input_ids"]
 
     def encode(self, text):
         boundary = text.rfind(self.MARKER)

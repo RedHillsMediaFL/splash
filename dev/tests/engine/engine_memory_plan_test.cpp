@@ -1,3 +1,4 @@
+// Modified by Red Hills Media on 2026-10-10 for this M1 Ultra source release.
 #include "TestChecks.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "TestModel.hpp"
@@ -347,6 +348,25 @@ void testDeviceValidationNamesTheMacosFloor() {
 }
 
 // The widest kernels dispatch threadgroups of 1024 threads.
+void testM1AdmissionPreservesPhysicalFamily() {
+  for (uint32_t cores : {48U, 64U}) {
+    auto m1 = device();
+    m1.appleGpuFamily = 7;
+    m1.hardwareAppleGpuFamily = 7;
+    m1.gpuCoreCount = cores;
+    require(!m1.validationError(), "physical M1 Ultra admission still requires an Apple9 disguise");
+  }
+  for (uint32_t cores : {8U, 16U, 24U, 32U, 47U, 49U, 63U, 65U}) {
+    auto smaller = device();
+    smaller.appleGpuFamily = 7;
+    smaller.hardwareAppleGpuFamily = 7;
+    smaller.gpuCoreCount = cores;
+    smaller.m1Ultra = true;
+    require(smaller.validationError().value_or("") == "apple_gpu_family_9_required",
+            "M1 flag admitted an unsupported physical GPU");
+  }
+}
+
 void testDeviceValidationNamesTheThreadgroupWidth() {
   DeviceCapabilities narrow = device();
   narrow.maxThreadgroupWidth = 512;
@@ -392,6 +412,7 @@ int main() {
     testModelProvidedKvGeometry();
     testExtentSizeFollowsThePool();
     testDeviceValidationNamesTheMacosFloor();
+    testM1AdmissionPreservesPhysicalFamily();
     testDeviceValidationNamesTheThreadgroupWidth();
     testDeviceValidationMessageNamesWhatTheMacHas();
     std::cout << "elastic memory plan tests passed\n";
