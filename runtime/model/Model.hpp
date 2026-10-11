@@ -341,6 +341,7 @@ struct ModelStepResult final {
   // exceptions and remain engine-fatal.
   std::string failure{};
   bool constraintReleased = false;
+  std::optional<uint32_t> firstToken{};
 
   bool operator==(const ModelStepResult &) const = default;
 };

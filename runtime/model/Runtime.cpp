@@ -2262,7 +2262,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
           result.finished = true;
         } else if (selected) {
           impl->commitSelected(entry, {&*selected, 1});
-          impl->emitTerminalAnchor(entry, result);
+          if (!impl->emitTerminalAnchor(entry, result))
+            result.firstToken = entry.pendingToken;
         } else {
           // The first token waits for the request's first mask. A replay
           // never gets here: it keeps its stage, and a request that holds

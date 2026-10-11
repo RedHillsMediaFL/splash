@@ -5423,6 +5423,78 @@ void testTerminalAnchorWithoutKvIsNotCached() {
   }
 }
 
+void testFirstTokenIsSentAtPrefill() {
+  for (const bool cancel : {false, true}) {
+    test::TestKvStorage storage(8, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor(1);
+    executor.firstTokens = true;
+    executor.decodeFinishes = false;
+    executor.decodeTokens = 4;
+    executor.holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
+    Events events;
+    engine::Engine engine(test::engineConfig(), resources, executor, events);
+    guardReleases(storage, engine);
+
+    EngineRequest value = request(91, std::vector<uint32_t>(40, 91));
+    value.maxNewTokens = 12;
+    engine.submit(std::move(value));
+    double now = 1;
+    tickUntil(engine, now, [&] { return !events.outputs[91].empty() && engine.commandInFlight(); },
+              "the first cycle did not start after the prompt");
+    require(events.outputs[91] == std::vector<uint32_t>{42},
+            "the first token did not reach the client before the first cycle");
+    if (cancel)
+      engine.cancel(91);
+    *executor.holdDecodeUntil = true;
+    tickUntil(engine, now, [&] { return idle(engine); }, "the request did not end");
+    const uint32_t expected = cancel ? 1 : 12;
+    require(events.completedCount == 1 && events.outputs[91].size() == expected &&
+                events.usage[91] == std::pair<uint32_t, uint32_t>{40, expected},
+            cancel ? "a cancelled request's usage left out the first token it was sent"
+                   : "the stream and the usage disagree on the tokens sent");
+  }
+}
+
+void testFirstTokenSentBeforeASuspensionIsNotSentAgain() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.firstTokens = true;
+  executor.decodeFinishes = false;
+  executor.decodeTokens = 4;
+  executor.beginGrowthBlocked = [&] {
+    return executor.lastBeginId == 2 && executor.requests.at(1).resident;
+  };
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+
+  const std::vector<uint32_t> prompt(40, 1);
+  auto background = request(1, prompt);
+  background.priority = RequestPriority::Background;
+  background.maxNewTokens = 12;
+  engine.submit(std::move(background));
+  double now = 1;
+  tickUntil(engine, now, [&] { return events.outputs.contains(1); },
+            "the first token was not sent at the prefill");
+  auto normal = request(2, std::vector<uint32_t>(9, 2));
+  normal.maxNewTokens = 4;
+  engine.submit(std::move(normal));
+  tickUntil(engine, now, [&] { return !executor.requests.at(1).resident; },
+            "the Background lane was not suspended");
+  require(events.outputs.at(1) == std::vector<uint32_t>{42},
+          "the suspended lane did not keep the first token it was sent");
+  tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+  require(executor.resumedPrompts == std::vector<std::vector<uint32_t>>{prompt} &&
+              events.completedCount == 2 && events.failedCount == 0 &&
+              events.outputs.at(1) == std::vector<uint32_t>(12, 42) &&
+              events.usage.at(1) == std::pair<uint32_t, uint32_t>{40, 12},
+          "the resumed lane replayed its first token or sent it again");
+}
+
 void testPrefillCanCompleteTheRequest() {
   for (bool stop : {false, true}) {
     test::TestKvStorage storage(8, 4096, 4);
@@ -8971,6 +9043,8 @@ int main() {
     testStalledSuspensionFailsWithCapacity();
     testTerminalAnchorWithoutKvIsNotCached();
     testPrefillCanCompleteTheRequest();
+    testFirstTokenIsSentAtPrefill();
+    testFirstTokenSentBeforeASuspensionIsNotSentAgain();
     testOutOfVocabularyOutputFailsLaneOnly();
     std::cout << "engine tests passed\n";
     return EXIT_SUCCESS;

@@ -338,6 +338,8 @@ public:
         step.outputTokens = {42};
         step.outputTokensWithoutKv = 1;
         step.finished = *prefillAnchor;
+      } else if (last && firstTokens && !state.constrained) {
+        step.firstToken = 42;
       }
       result.push_back(std::move(step));
     }
@@ -618,6 +620,7 @@ public:
   std::optional<uint32_t> poisonToken;
   // Set when prefill itself ends the request: the value is `finished` (stop).
   std::optional<bool> prefillAnchor;
+  bool firstTokens = false;
   std::shared_ptr<std::atomic<bool>> holdDecodeUntil;
   std::shared_ptr<std::atomic<bool>> holdPrefillUntil;
   // The completion of the latest held command, for the test to call as

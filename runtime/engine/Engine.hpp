@@ -254,6 +254,7 @@ private:
     // The prompt from submit on, then the committed output; request.prompt
     // is empty.
     std::vector<uint32_t> exactTokens;
+    std::optional<uint32_t> sentFirstToken;
     // Made from exactTokens and request.images, which do not change while
     // the request waits; refreshed each pass and dropped once it starts or
     // skips the cache.
@@ -389,6 +390,7 @@ private:
   // The prompt rows a lane in prefill has processed, or the tokens a
   // decoding lane holds.
   [[nodiscard]] uint64_t completedTokens(const Request &request) const;
+  [[nodiscard]] static uint32_t generatedTokens(const Request &request) noexcept;
   // Whether lane a gives up its memory before lane b: the lower priority,
   // then, at equal priority, a lane in prefill before a decoding one, then
   // the one with fewer completed tokens.

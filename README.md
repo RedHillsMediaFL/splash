@@ -23,6 +23,8 @@ upstream model families and newer-GPU paths remain unchanged.
   of 0/64/256/1024/4096/16384 reasoning tokens and visible-answer reservation.
 - Retire completed reasoning masks after committed closure and an unrestricted
   mask proof, while keeping tool/JSON grammars and exact effort budgets.
+- Emit unconstrained first tokens directly after prefill, retaining the masked
+  path for reasoning and tool/JSON constraints (upstream PR #358).
 - Existing-family MLX checkpoint staging and tool/API compatibility fixes.
 
 Effort levels are runtime instructions and enforced ceilings, not a claim that
@@ -73,6 +75,14 @@ The thinking-off control measured 235.5 versus 235.0 tokens/s, and the strict-JS
 control kept its grammar and identical valid output. This targeted check is not
 a general throughput guarantee or a long-context benchmark.
 
+## First-token check
+
+With **112 input / 591 output tokens**, thinking off, greedy sampling and a
+262,144-token context limit, one cold-cache native pair measured first-token
+latency of **197.3 → 166.9 ms**. Prefill stayed at **774.8 tokens/s** and decode
+at **238.9–239.0 tokens/s**, with identical output. Medium reasoning and strict
+JSON checks also preserved their output and constraints.
+
 ## Historical build identity
 
 The measured native source identity was
@@ -84,7 +94,8 @@ notices and whitespace-only cleanup. These change source fingerprints. No binary
 rebuilt for this source release, and byte-for-byte build reproducibility is not
 claimed.
 This branch also includes later Python tool-error guidance and native
-reasoning-tail changes. The earlier warm smoke used the executable above;
+reasoning-tail changes, plus upstream's first-token update through
+`cbbe322106fb960ce5e92cac75c52b729962ede9`. The earlier warm smoke used the executable above;
 the paired reasoning-tail check used a separately built candidate.
 
 ## License
