@@ -1611,6 +1611,18 @@ void Engine::apply(const BatchPlan &plan,
     if (result.outputTokensWithoutKv > result.outputTokens.size()) {
       throw std::logic_error("model reported more uncommitted tokens than output");
     }
+    if (result.constraintReleased &&
+        (plan.kind != WorkKind::Decode || !plan.constrained ||
+         plan.decodeStage != DecodeStage::Regular ||
+         active.request.constraint != ConstraintMode::TokenMask ||
+         !(active.request.flags & RequestAllowUnconstrainedTail) ||
+         result.nextDecodeStage != DecodeStage::Regular || result.finished ||
+         result.outputTokensWithoutKv ||
+         active.exactTokens.size() + result.outputTokens.size() -
+                 active.promptTokens >=
+             active.request.maxNewTokens)) {
+      throw std::logic_error("invalid constraint release");
+    }
     if (plan.kind == WorkKind::Prefill) {
       const uint32_t promptProcessed =
           item.promptOffset + result.consumedPromptTokens;
@@ -1675,8 +1687,11 @@ void Engine::apply(const BatchPlan &plan,
     if (result.outputTokensWithoutKv && !complete) {
       throw std::logic_error("model emitted an uncommitted token and continued");
     }
-    schedulerResults.push_back({active.request.id, result.consumedPromptTokens,
-                                complete, result.nextDecodeStage});
+    if (result.constraintReleased)
+      active.request.constraint = ConstraintMode::None;
+    schedulerResults.push_back(
+        {active.request.id, result.consumedPromptTokens, complete,
+         result.nextDecodeStage, result.constraintReleased});
     if (waitsForMask(result.nextDecodeStage)) {
       events_.maskRequested(active.request.id, {});
       active.maskRequestedMilliseconds = now;

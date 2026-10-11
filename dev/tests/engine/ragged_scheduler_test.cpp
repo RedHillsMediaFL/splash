@@ -461,6 +461,153 @@ void testConstrainedDecodeRemainsSeparate() {
           "constrained decode lost its independent mask pipeline");
 }
 
+void testConstraintReleaseJoinsUnconstrainedDecodeAfterCompletion() {
+  Scheduler scheduler(0.0);
+  for (uint64_t requestId : {1, 2}) {
+    scheduler.submit(request(requestId, 1, true));
+    scheduler.resourcesReady(requestId, 0);
+  }
+  const BatchPlan prompts = *scheduler.next({});
+  require(prompts.kind == WorkKind::Prefill && prompts.width() == 2,
+          "release setup did not batch the constrained prompts");
+  scheduler.commit(prompts, {});
+  const std::array promptResults{
+      StepResult{1, 1, false, DecodeStage::ApplyInitialMask},
+      StepResult{2, 1, false, DecodeStage::ApplyInitialMask}};
+  scheduler.complete(prompts, promptResults, 0.0, true);
+  scheduler.maskReady(1);
+  scheduler.maskReady(2);
+  const BatchPlan initialSelection = *scheduler.next({});
+  require(initialSelection.kind == WorkKind::Decode &&
+              initialSelection.constrained && initialSelection.width() == 2 &&
+              initialSelection.decodeStage == DecodeStage::ApplyInitialMask,
+          "release setup skipped the constrained initial selection");
+  completeDecode(scheduler);
+  scheduler.submit(request(3, 1));
+  scheduler.resourcesReady(3, 1);
+  const std::array<uint64_t, 1> excluded{3};
+  const BatchPlan regular = *scheduler.next(excluded);
+  require(regular.kind == WorkKind::Decode && regular.constrained &&
+              regular.width() == 2 &&
+              regular.decodeStage == DecodeStage::Regular,
+          "release was not tested on a regular constrained batch");
+  scheduler.commit(regular, excluded);
+  const std::array results{
+      StepResult{1, 0, false, DecodeStage::Regular, true},
+      StepResult{2, 0, false, DecodeStage::Regular, false}};
+  auto invalidResults = results;
+  invalidResults[1].requestId = 99;
+  rejects([&] { scheduler.complete(regular, invalidResults, 0.0, true); },
+          "completion request order changed",
+          "release accepted a malformed peer completion");
+  require(!scheduler.next({}) && scheduler.phase(1) == Phase::Decode &&
+              scheduler.phase(2) == Phase::Decode,
+          "failed completion retired the active constrained batch");
+  auto invalidReleaseResults = results;
+  invalidReleaseResults[1].finished = true;
+  invalidReleaseResults[1].constraintReleased = true;
+  rejects([&] {
+    scheduler.complete(regular, invalidReleaseResults, 0.0, true);
+  }, "constraint release", "release accepted an unsafe peer handoff");
+  require(!scheduler.next({}) && scheduler.phase(1) == Phase::Decode &&
+              scheduler.phase(2) == Phase::Decode,
+          "unsafe peer handoff partially retired the constrained batch");
+  scheduler.complete(regular, results, 0.0, true);
+  const BatchPlan unconstrained = *scheduler.next({});
+  require(unconstrained.kind == WorkKind::Decode &&
+              !unconstrained.constrained && unconstrained.width() == 2 &&
+              unconstrained.decodeStage == DecodeStage::Regular &&
+              std::any_of(unconstrained.items.begin(),
+                          unconstrained.items.end(), [](const BatchItem &item) {
+                            return item.requestId == 1;
+                          }) &&
+              std::any_of(unconstrained.items.begin(),
+                          unconstrained.items.end(), [](const BatchItem &item) {
+                            return item.requestId == 3;
+                          }),
+          "completed release did not join only the unconstrained peer");
+  completeDecode(scheduler);
+  const BatchPlan constrained = *scheduler.next({});
+  require(constrained.kind == WorkKind::Decode && constrained.constrained &&
+              constrained.width() == 1 &&
+              constrained.items[0].requestId == 2 &&
+              constrained.decodeStage == DecodeStage::Regular,
+          "one lane's release removed its peer's constraint");
+}
+
+void testConstraintReleaseRejectsUnsafeStages() {
+  struct UnsafeReleaseCase {
+    bool constrained;
+    WorkKind kind;
+    DecodeStage batchStage;
+    DecodeStage nextStage;
+    bool finished;
+  };
+  const std::array cases{
+      UnsafeReleaseCase{true, WorkKind::Prefill, DecodeStage::Regular,
+                        DecodeStage::ApplyInitialMask, false},
+      UnsafeReleaseCase{true, WorkKind::Decode, DecodeStage::ApplyInitialMask,
+                        DecodeStage::Regular, false},
+      UnsafeReleaseCase{false, WorkKind::Decode, DecodeStage::Regular,
+                        DecodeStage::Regular, false},
+      UnsafeReleaseCase{true, WorkKind::Decode, DecodeStage::Regular,
+                        DecodeStage::Regular, true},
+      UnsafeReleaseCase{true, WorkKind::Decode, DecodeStage::Regular,
+                        DecodeStage::ApplyInitialMask, false}};
+  for (const UnsafeReleaseCase &scenario : cases) {
+    Scheduler scheduler(0.0);
+    scheduler.submit(request(1, 1, scenario.constrained));
+    if (scenario.kind == WorkKind::Prefill) {
+      scheduler.resourcesReady(1, 0);
+    } else if (scenario.constrained) {
+      scheduler.resourcesReady(1, 0);
+      awaitFirstMask(scheduler, 1);
+      scheduler.maskReady(1);
+      if (scenario.batchStage == DecodeStage::Regular)
+        completeDecode(scheduler);
+    } else {
+      scheduler.resourcesReady(1, 1);
+    }
+    const BatchPlan plan = *scheduler.next({});
+    require(plan.kind == scenario.kind &&
+                plan.decodeStage == scenario.batchStage &&
+                (plan.kind != WorkKind::Decode ||
+                 plan.constrained == scenario.constrained),
+            "unsafe release setup did not reach its intended stage");
+    const Phase phaseBeforeCompletion = scheduler.phase(1);
+    scheduler.commit(plan, {});
+    StepResult result{1, plan.items[0].tokenCount, scenario.finished,
+                      scenario.nextStage, true};
+    rejects([&] {
+      scheduler.complete(plan, std::span<const StepResult>(&result, 1), 0.0,
+                         true);
+    }, "constraint release", "unsafe constraint release was accepted");
+    require(scheduler.phase(1) == phaseBeforeCompletion && !scheduler.next({}),
+            "rejected release changed or retired its active lane");
+    result.constraintReleased = false;
+    result.finished = false;
+    result.nextDecodeStage = scenario.kind == WorkKind::Prefill
+                                 ? DecodeStage::ApplyInitialMask
+                                 : DecodeStage::Regular;
+    scheduler.complete(plan, std::span<const StepResult>(&result, 1), 0.0,
+                       true);
+    if (scenario.kind == WorkKind::Prefill) {
+      require(scheduler.phase(1) == Phase::WaitingMask &&
+                  scheduler.promptProcessed(1) == 1,
+              "rejected prefill release skipped or duplicated the initial mask");
+      scheduler.maskReady(1);
+    }
+    const BatchPlan continuation = *scheduler.next({});
+    require(continuation.kind == WorkKind::Decode &&
+                continuation.constrained == scenario.constrained &&
+                continuation.decodeStage ==
+                    (scenario.kind == WorkKind::Prefill
+                         ? DecodeStage::ApplyInitialMask
+                         : DecodeStage::Regular),
+            "rejected release changed the continuation's constraint or stage");
+  }
+}
+
 void testPrefillAndDecodeAlternateWithoutStarvation() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1));
@@ -1119,6 +1266,8 @@ int main() {
     testUnconstrainedLanesShareDecode();
     testRejectedCommitCountsNothing();
     testConstrainedDecodeRemainsSeparate();
+    testConstraintReleaseJoinsUnconstrainedDecodeAfterCompletion();
+    testConstraintReleaseRejectsUnsafeStages();
     testPrefillAndDecodeAlternateWithoutStarvation();
     testDecodeRepaysItsShareOfContendedPrefill();
     testMaskWaitAccruesNoDecodeDebt();

@@ -25,6 +25,7 @@ namespace {
 using namespace splash::protocol;
 using splash::ConstraintMode;
 using splash::ImageSpan;
+using splash::RequestAllowUnconstrainedTail;
 using splash::RequestIgnoreEndOfSequence;
 using splash::SamplingParameters;
 using splash::engine::EngineFinishReason;
@@ -856,17 +857,59 @@ void testRequestFlags() {
   RequestFrame progress = request;
   progress.flags |= kReturnProgressFlag;
   CHECK(test, roundTrip(progress) == progress);
-  for (const uint32_t flags : {1U << 2, 1U << 31, 0xffffffffU}) {
+  RequestFrame released = exampleRequest();
+  released.flags = RequestAllowUnconstrainedTail;
+  CHECK(test, roundTrip(released) == released);
+  released.flags |= kReturnProgressFlag;
+  CHECK(test, roundTrip(released) == released);
+  for (const uint32_t flags : {1U << 3, 1U << 31, 0xffffffffU}) {
     RequestFrame undefined = request;
     undefined.flags = flags;
     expectRequestIssue(test, undefined, IssueCode::InvalidEnumValue);
   }
+  RequestFrame unconstrained = released;
+  unconstrained.constraint = ConstraintMode::None;
+  expectRequestIssue(test, unconstrained, IssueCode::InvalidConstraint);
   RequestFrame constrained = exampleRequest();
   constrained.flags = RequestIgnoreEndOfSequence;
   expectRequestIssue(test, constrained, IssueCode::InvalidConstraint);
   RequestFrame score = exampleScoreRequest();
   score.flags = RequestIgnoreEndOfSequence;
   expectRequestIssue(test, score, IssueCode::InvalidConstraint);
+  score.flags = RequestAllowUnconstrainedTail;
+  expectRequestIssue(test, score, IssueCode::InvalidConstraint);
+}
+
+void testUnconstrainedTailRequiresCompleteMaskProof() {
+  constexpr std::string_view test = "unconstrained tail mask proof";
+  const std::array<uint32_t, 8> unrestricted{
+      0xffffffffU, 0xffffffffU, 0xffffffffU, 0xffffffffU,
+      0xffffffffU, 0xffffffffU, 0xffffffffU, 0xffffffffU};
+  CHECK(test, splash::canReleaseConstraint(RequestAllowUnconstrainedTail,
+                                          unrestricted));
+  CHECK(test, splash::canReleaseConstraint(
+                  RequestAllowUnconstrainedTail | kReturnProgressFlag,
+                  unrestricted));
+  CHECK(test, !splash::canReleaseConstraint(0, unrestricted));
+  CHECK(test,
+        !splash::canReleaseConstraint(kReturnProgressFlag, unrestricted));
+  CHECK(test, !splash::canReleaseConstraint(RequestIgnoreEndOfSequence,
+                                           unrestricted));
+  CHECK(test, !splash::canReleaseConstraint(
+                  RequestAllowUnconstrainedTail, std::span<const uint32_t>{}));
+  for (size_t index = 0; index < unrestricted.size(); ++index) {
+    auto restricted = unrestricted;
+    restricted[index] &= ~(1U << index);
+    CHECK(test, !splash::canReleaseConstraint(RequestAllowUnconstrainedTail,
+                                             restricted));
+  }
+  auto futureUnrestricted = unrestricted;
+  futureUnrestricted.front() = 0;
+  CHECK(test, !splash::canReleaseConstraint(RequestAllowUnconstrainedTail,
+                                           futureUnrestricted));
+  CHECK(test, splash::canReleaseConstraint(
+                  RequestAllowUnconstrainedTail,
+                  std::span<const uint32_t>(futureUnrestricted).subspan(2)));
 }
 
 std::string jsonOfExactSize(size_t bytes) {
@@ -1071,6 +1114,7 @@ int main(int argc, char **argv) {
     testPromptAndImageSpanRejections();
     testSamplingBlock();
     testRequestFlags();
+    testUnconstrainedTailRequiresCompleteMaskProof();
     testBoundedArbitraryStatusJsonAndFrames();
     testFailureTaxonomy();
     testUnnamedRequestFailuresAreFatal();

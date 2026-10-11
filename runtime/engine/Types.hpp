@@ -22,6 +22,7 @@ struct StepResult final {
   uint32_t consumedPromptTokens = 0;
   bool finished = false;
   DecodeStage nextDecodeStage = DecodeStage::Regular;
+  bool constraintReleased = false;
 };
 
 // Values are the Done event's reason byte.

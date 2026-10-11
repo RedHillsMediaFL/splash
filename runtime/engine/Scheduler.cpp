@@ -469,6 +469,18 @@ void Scheduler::complete(const BatchPlan &plan,
     if (result.requestId != item.requestId) {
       throw std::logic_error("completion request order changed");
     }
+    const Request &request = get(item.requestId);
+    if (result.constraintReleased &&
+        (plan.kind != WorkKind::Decode || !plan.constrained ||
+         !request.spec.constrained ||
+         plan.decodeStage != DecodeStage::Regular ||
+         result.nextDecodeStage != DecodeStage::Regular || result.finished)) {
+      throw std::logic_error("invalid constraint release");
+    }
+  }
+  for (size_t index = 0; index < results.size(); ++index) {
+    const BatchItem &item = plan.items[index];
+    const StepResult &result = results[index];
     Request &request = get(item.requestId);
     if (plan.kind == WorkKind::Prefill) {
       if (result.consumedPromptTokens != item.tokenCount ||
@@ -494,6 +506,8 @@ void Scheduler::complete(const BatchPlan &plan,
       }
     } else {
       request.decodeStage = result.nextDecodeStage;
+      if (result.constraintReleased)
+        request.spec.constrained = false;
       request.phase = result.finished ? Phase::Completed : Phase::Decode;
     }
   }

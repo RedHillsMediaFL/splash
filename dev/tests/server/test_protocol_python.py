@@ -631,7 +631,7 @@ class ProtocolPythonTests(unittest.TestCase):
         # scoring decides the output, fails the request.
         cases = [
             (replace(request, flags=flags), p.IssueCode.INVALID_ENUM_VALUE)
-            for flags in (1 << 2, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
+            for flags in (1 << 3, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
         ] + [
             (
                 replace(base, flags=p.RequestFlag.IGNORE_END_OF_SEQUENCE),
@@ -647,6 +647,31 @@ class ProtocolPythonTests(unittest.TestCase):
                     lambda invalid=invalid: p.serialize_message(invalid),
                 )
                 self.assertEqual(issue.request_id, request.request_id)
+
+    def test_unconstrained_tail_flag_requires_token_mask_generation(self):
+        for flags in (
+            p.RequestFlag.ALLOW_UNCONSTRAINED_TAIL,
+            p.RequestFlag.ALLOW_UNCONSTRAINED_TAIL | p.RequestFlag.RETURN_PROGRESS,
+        ):
+            with self.subTest(flags=flags):
+                request = replace(example_request(), flags=flags)
+                wire = p.serialize_message(request)
+                self.assertEqual(
+                    struct.unpack_from(
+                        "<I", wire, p.FRAME_HEADER_BYTES + OFFSET["flags"]
+                    )[0],
+                    int(flags),
+                )
+                self.assertEqual(decode_client(wire), request)
+        for base in (example_ignore_eos_request(), example_score_request()):
+            invalid = replace(base, flags=p.RequestFlag.ALLOW_UNCONSTRAINED_TAIL)
+            with self.subTest(score=bool(invalid.score_tokens)):
+                issue = self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_CONSTRAINT,
+                    lambda: p.serialize_message(invalid),
+                )
+                self.assertEqual(issue.request_id, invalid.request_id)
 
     def test_token_words_must_be_exact_uint32_ints(self):
         base = example_request()

@@ -134,6 +134,25 @@ class ReasoningBudgetTests(unittest.TestCase):
         self.assertEqual(constraint.reasoning_tokens, 0)
         self.assertTrue(constraint.budget_exhausted)
 
+    def test_unrestricted_tail_requires_committed_close_in_row_zero(self):
+        constraint = ReasoningBudgetConstraint(1)
+        rows = decode_masks(constraint.masks([101, THINK_END_TOKEN_ID, 102]))
+        self.assertFalse(np.all(rows == np.uint32(0xFFFFFFFF)))
+        self.assertFalse(np.all(rows[0] == np.uint32(0xFFFFFFFF)))
+        self.assertTrue(np.all(rows[2:] == np.uint32(0xFFFFFFFF)))
+        self.assertTrue(constraint.thinking)
+        self.assertEqual(constraint.reasoning_tokens, 0)
+        constraint.commit([101])
+        rows = decode_masks(constraint.masks([THINK_END_TOKEN_ID, 102]))
+        self.assertFalse(np.all(rows[0] == np.uint32(0xFFFFFFFF)))
+        self.assertEqual(sum(int(word).bit_count() for word in rows[0]), 1)
+        constraint.commit([THINK_END_TOKEN_ID])
+        rows = decode_masks(constraint.masks([102, TokenConstraint.EOS_TOKENS[0]]))
+        self.assertTrue(np.all(rows == np.uint32(0xFFFFFFFF)))
+        self.assertFalse(constraint.thinking)
+        self.assertEqual(constraint.reasoning_tokens, 1)
+        self.assertTrue(constraint.budget_exhausted)
+
     def test_budget_intersects_and_never_bypasses_output_grammar(self):
         columns = (TokenConstraint.VOCABULARY + 31) // 32
         mask = np.zeros((2, columns), dtype=np.uint32)
@@ -194,10 +213,70 @@ class ReasoningFrontendTests(unittest.TestCase):
                 self.assertIsNone(job.constraint)
                 self.assertFalse(job.thinking)
                 self.assertEqual(frame.constraint, wire.ConstraintMode.NONE)
+                self.assertFalse(frame.flags & wire.RequestFlag.ALLOW_UNCONSTRAINED_TAIL)
             else:
                 self.assertIsInstance(job.constraint, ReasoningBudgetConstraint)
                 self.assertEqual(job.reasoning_budget_tokens, expected)
                 self.assertEqual(frame.constraint, wire.ConstraintMode.TOKEN_MASK)
+                self.assertTrue(frame.flags & wire.RequestFlag.ALLOW_UNCONSTRAINED_TAIL)
+
+    def test_inner_grammar_never_opts_into_unconstrained_tail(self):
+        harness = self.harness()
+        job = harness.app.prepare(
+            fixtures.chat_body(reasoning_effort="low", max_tokens=256),
+            deadline=fixtures.FOREVER,
+        )
+        job.flags = (
+            wire.RequestFlag.RETURN_PROGRESS | wire.RequestFlag.ALLOW_UNCONSTRAINED_TAIL
+        )
+        grammar = mock.Mock(spec=TokenConstraint)
+        columns = (TokenConstraint.VOCABULARY + 31) // 32
+        grammar.masks.return_value = np.full(
+            (1, columns), 0xFFFFFFFF, dtype=np.uint32
+        ).tobytes()
+        for constraint in (grammar, ReasoningBudgetConstraint(64, grammar)):
+            with self.subTest(constraint=type(constraint).__name__):
+                job.constraint = constraint
+                frame = harness.backend._generation_request(job).frame
+                self.assertEqual(frame.constraint, wire.ConstraintMode.TOKEN_MASK)
+                self.assertFalse(frame.flags & wire.RequestFlag.ALLOW_UNCONSTRAINED_TAIL)
+                self.assertTrue(frame.flags & wire.RequestFlag.RETURN_PROGRESS)
+        job.constraint.commit([THINK_END_TOKEN_ID])
+        rows = decode_masks(job.constraint.masks([]))
+        self.assertTrue(np.all(rows == np.uint32(0xFFFFFFFF)))
+        frame = harness.backend._generation_request(job).frame
+        self.assertFalse(frame.flags & wire.RequestFlag.ALLOW_UNCONSTRAINED_TAIL)
+
+    def test_release_flag_preserves_wrapper_budget_reserve_and_audit(self):
+        harness = self.harness()
+        job = harness.app.prepare(
+            fixtures.chat_body(reasoning_effort="max", max_tokens=64),
+            deadline=fixtures.FOREVER,
+        )
+        job.flags = wire.RequestFlag.RETURN_PROGRESS
+        constraint = job.constraint
+        frame = harness.backend._generation_request(job).frame
+        self.assertEqual(
+            frame.flags,
+            wire.RequestFlag.RETURN_PROGRESS | wire.RequestFlag.ALLOW_UNCONSTRAINED_TAIL,
+        )
+        self.assertEqual(job.flags, wire.RequestFlag.RETURN_PROGRESS)
+        self.assertIs(job.constraint, constraint)
+        self.assertEqual(frame.logical_max_output_tokens, 64)
+        details = reasoning_details(job)
+        self.assertEqual(details["reasoning_requested_budget_tokens"], 16384)
+        self.assertEqual(details["reasoning_budget_tokens"], 47)
+        self.assertEqual(details["answer_reserve_tokens"], 16)
+        constraint.commit([101] * 47 + [THINK_END_TOKEN_ID])
+        self.assertTrue(
+            np.all(decode_masks(constraint.masks([102])) == np.uint32(0xFFFFFFFF))
+        )
+        constraint.commit([102] * 16)
+        constraint.finish()
+        self.assertIs(job.constraint, constraint)
+        self.assertEqual(constraint.reasoning_tokens, 47)
+        self.assertTrue(constraint.budget_exhausted)
+        self.assertTrue(reasoning_details(job)["reasoning_budget_exhausted"])
 
     def test_clamp_metadata_and_responses_use_the_same_budget(self):
         harness = self.harness()

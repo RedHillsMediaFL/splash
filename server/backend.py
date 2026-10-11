@@ -595,6 +595,12 @@ class NativeBackend:
             if job.constraint is not None
             else wire.ConstraintMode.NONE
         )
+        flags = job.flags & ~int(wire.RequestFlag.ALLOW_UNCONSTRAINED_TAIL)
+        if (
+            isinstance(job.constraint, ReasoningBudgetConstraint)
+            and job.constraint.constraint is None
+        ):
+            flags |= wire.RequestFlag.ALLOW_UNCONSTRAINED_TAIL
         frame = wire.RequestFrame(
             request_id=0,
             priority=job.priority,
@@ -609,7 +615,7 @@ class NativeBackend:
             image_pixels=job.image_pixels,
             score_tokens=job.score_tokens,
             generation_prompt_tokens=job.generation_prompt_tokens,
-            flags=job.flags,
+            flags=flags,
         )
         return engine_runtime.GenerationRequest(
             frame, job.deadline, self._mask_provider(job), job.image_owner

@@ -258,6 +258,7 @@ struct Runtime::Impl {
     // computation with target verification. This is model runtime state, not a
     // scheduler decode stage.
     bool verifyMaskInFlight = false;
+    bool releaseConstraintPending = false;
     uint64_t rngCounter = 0;
     DecodeStage decodeStage = DecodeStage::Regular;
     std::optional<DraftContextPlan> draftContextPlan;
@@ -1694,6 +1695,7 @@ struct Runtime::Impl {
         // the request.
         entry.maskWords.clear();
         entry.verifyMaskInFlight = false;
+        entry.releaseConstraintPending = false;
         results.push_back({.requestId = entry.id,
                            .failure = std::move(laneResult.failure)});
         continue;
@@ -1737,6 +1739,12 @@ struct Runtime::Impl {
       ModelStepResult &result = results.back();
       if (entry.generatedTokens < entry.maxNewTokens)
         emitTerminalAnchor(entry, result);
+      if (std::exchange(entry.releaseConstraintPending, false) &&
+          entry.constraint == ConstraintMode::TokenMask && !result.finished &&
+          entry.generatedTokens < entry.maxNewTokens) {
+        entry.constraint = ConstraintMode::None;
+        result.constraintReleased = true;
+      }
     }
 
     counters.lastDecodeGpuSeconds = timing.gpuSeconds;
@@ -2024,7 +2032,9 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   entry.images = std::move(images);
   entry.restoredTokens = request.restoredTokens;
   impl_->bindPenalties(entry, request.prompt);
-  if (impl_->promptLookupEnabled && entry.constraint == ConstraintMode::None &&
+  if (impl_->promptLookupEnabled &&
+      (entry.constraint == ConstraintMode::None ||
+       (entry.flags & RequestAllowUnconstrainedTail)) &&
       request.images.empty() && request.scoreTokens.empty())
     entry.promptLookup.reset(request.prompt);
   auto [_, inserted] = impl_->requests.emplace(request.id, std::move(entry));
@@ -2486,6 +2496,7 @@ Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
     }
   }
   entry.maskWords.assign(words.begin(), words.end());
+  entry.releaseConstraintPending = canReleaseConstraint(entry.flags, words);
   return std::nullopt;
 }
 

@@ -21,6 +21,8 @@ upstream model families and newer-GPU paths remain unchanged.
 - GPU-only prefill FFNs on M1 Ultra; its unbounded ANE calibration path is avoided.
 - Request-local `none/low/medium/high/xhigh/max` effort profiles, with ceilings
   of 0/64/256/1024/4096/16384 reasoning tokens and visible-answer reservation.
+- Retire completed reasoning masks after committed closure and an unrestricted
+  mask proof, while keeping tool/JSON grammars and exact effort budgets.
 - Existing-family MLX checkpoint staging and tool/API compatibility fixes.
 
 Effort levels are runtime instructions and enforced ceilings, not a claim that
@@ -61,7 +63,17 @@ Read/edit/test completed in about **6 seconds**, with **4/4 tests passing**.
 The model was already loaded. This is a small cached smoke run, not a standard
 benchmark, a baseline speedup, or a speed guarantee.
 
-## Source versus deployed binary
+## Reasoning-tail check
+
+One cold-cache native pair on the hardware above used identical weights, greedy
+sampling, batch/concurrency 1, and medium effort: **249 input / 929 total output
+tokens**, including 256 reasoning tokens. Decode moved from **199.1 to 203.7
+tokens/s**, with identical output tokens; mask requests fell from **150 to 49**.
+The thinking-off control measured 235.5 versus 235.0 tokens/s, and the strict-JSON
+control kept its grammar and identical valid output. This targeted check is not
+a general throughput guarantee or a long-context benchmark.
+
+## Historical build identity
 
 The measured native source identity was
 `bf1ac87654060b0cd9e807460756e8adc61a6dea5da14848f4039066b83eeb3b`;
@@ -71,8 +83,9 @@ The source was checked against that identity before adding public modification
 notices and whitespace-only cleanup. These change source fingerprints. No binary is distributed or
 rebuilt for this source release, and byte-for-byte build reproducibility is not
 claimed.
-This branch also includes a later Python-only tool-error guidance fix; the
-measured native executable remains unchanged.
+This branch also includes later Python tool-error guidance and native
+reasoning-tail changes. The earlier warm smoke used the executable above;
+the paired reasoning-tail check used a separately built candidate.
 
 ## License
 

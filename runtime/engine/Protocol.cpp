@@ -362,6 +362,11 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
                      "score requests require greedy default sampling");
     }
   }
+  if ((request.flags & RequestAllowUnconstrainedTail) &&
+      (scoring || request.constraint != ConstraintMode::TokenMask)) {
+    return invalid(IssueCode::InvalidConstraint,
+                   "only token-mask generation can release its constraint");
+  }
   // A grammar decides where constrained output ends.
   if ((request.flags & RequestIgnoreEndOfSequence) &&
       (scoring || request.constraint != ConstraintMode::None)) {

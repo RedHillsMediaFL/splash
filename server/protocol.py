@@ -187,11 +187,14 @@ class RequestFlag(IntFlag):
     IGNORE_END_OF_SEQUENCE = 1 << 0
     # Report the prompt's progress while it prefills (PromptProgressEvent).
     RETURN_PROGRESS = 1 << 1
+    ALLOW_UNCONSTRAINED_TAIL = 1 << 2
 
 
 # A request with any other bit set is a request error.
 _REQUEST_FLAG_BITS = int(
-    RequestFlag.IGNORE_END_OF_SEQUENCE | RequestFlag.RETURN_PROGRESS
+    RequestFlag.IGNORE_END_OF_SEQUENCE
+    | RequestFlag.RETURN_PROGRESS
+    | RequestFlag.ALLOW_UNCONSTRAINED_TAIL
 )
 
 
@@ -686,6 +689,14 @@ def _validated_request(
         _fail_request(
             IssueCode.INVALID_CONSTRAINT,
             "score requests do not accept output constraints",
+            request_id,
+        )
+    if flags & RequestFlag.ALLOW_UNCONSTRAINED_TAIL and (
+        scores or constraint is not ConstraintMode.TOKEN_MASK
+    ):
+        _fail_request(
+            IssueCode.INVALID_CONSTRAINT,
+            "only token-mask generation can release its constraint",
             request_id,
         )
     # A grammar decides where constrained output ends.

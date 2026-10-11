@@ -5,6 +5,7 @@
 #include "ops/Vision.hpp"
 #include "model/StateTransfer.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -44,9 +45,20 @@ enum RequestFlag : uint32_t {
   // Never select the model's stop tokens, so generation runs to its output
   // limit. Only unconstrained generation can carry it.
   RequestIgnoreEndOfSequence = 1U << 0,
+  RequestAllowUnconstrainedTail = 1U << 2,
 };
 
-inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
+inline constexpr uint32_t kRequestFlagBits =
+    RequestIgnoreEndOfSequence | RequestAllowUnconstrainedTail;
+
+[[nodiscard]] inline bool
+canReleaseConstraint(uint32_t flags,
+                     std::span<const uint32_t> words) noexcept {
+  return (flags & RequestAllowUnconstrainedTail) && !words.empty() &&
+         std::all_of(words.begin(), words.end(), [](uint32_t word) {
+           return word == std::numeric_limits<uint32_t>::max();
+         });
+}
 
 // A request's token selection, its fields in the native request frame's
 // order. The defaults are greedy selection with nothing changing the logits.
@@ -328,6 +340,7 @@ struct ModelStepResult final {
   // rest of the batch stands. Broken invariants and GPU faults stay
   // exceptions and remain engine-fatal.
   std::string failure{};
+  bool constraintReleased = false;
 
   bool operator==(const ModelStepResult &) const = default;
 };
